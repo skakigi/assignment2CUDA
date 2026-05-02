@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build outputs
+build/
+dist/
+*.egg-info/
+*.so
+*.o
+*.a
+
+# CUDA / compiler intermediates
+*.ptx
+*.cubin
+*.fatbin
+
+# Local caches
+.cache/
+.ipynb_checkpoints/
+
+# Logs
+*.log
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/

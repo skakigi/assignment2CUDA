@@ -1,0 +1,10 @@
+[build-system]
+requires = ["setuptools>=64", "wheel", "torch"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cuda-sumcheck-current"
+version = "0.3.0"
+description = "Reconstructed CUDA SumCheck implementation for product-of-MLE tables"
+requires-python = ">=3.9"
+dependencies = ["numpy"]

@@ -114,18 +114,21 @@ def main():
 
     headers = [
         "template",
+        "function",
         "N",
+        "rows",
+        "terms",
         "deg",
-        "regular_generic_ms",
-        "full_generic_ms",
-        "regular_spec_ms",
-        "full_spec_ms",
-        "full_generic_speed",
-        "full_spec_speed",
+        "generic_ms",
+        "spec_ms",
+        "speedup",
+        "generic_p90",
+        "spec_p90",
+        "generic_Mpts/s",
+        "spec_Mpts/s",
         "shape",
     ]
-
-    widths = [24, 10, 4, 18, 16, 16, 13, 18, 15, 12]
+    widths = [24, 62, 10, 5, 5, 4, 12, 10, 8, 12, 10, 15, 13, 12]
 
     for nv in num_vars_list:
         print()
@@ -151,9 +154,9 @@ def main():
             full_spec_fn = build_full_mont_specialized_call(tables, chals, poly)
 
             _rgf, rgmed, _rgp90, rgout = bench(regular_generic_fn, args.warmup, args.runs)
-            _fgf, fgmed, _fgp90, fgout = bench(full_generic_fn, args.warmup, args.runs)
+            _fgf, fgmed, fgp90, fgout = bench(full_generic_fn, args.warmup, args.runs)
             _rsf, rsmed, _rsp90, rsout = bench(regular_spec_fn, args.warmup, args.runs)
-            _fsf, fsmed, _fsp90, fsout = bench(full_spec_fn, args.warmup, args.runs)
+            _fsf, fsmed, fsp90, fsout = bench(full_spec_fn, args.warmup, args.runs)
 
             if args.check:
                 ref = rgout.detach().cpu()
@@ -174,19 +177,29 @@ def main():
 
             n = 1 << nv
 
+            rows = base.rows_for_terms(terms)
+            term_count = len(terms)
+            deg = base.degree_for_terms(terms)
+            speedup = fgmed / fsmed if fsmed > 0 else float("inf")
+            generic_mpts = (n / fgmed) / 1000.0 if fgmed > 0 else 0.0
+            spec_mpts = (n / fsmed) / 1000.0 if fsmed > 0 else 0.0
+
             row = [
                 poly,
+                base.FUNCTIONS[poly],
                 f"{n:d}",
-                f"{base.degree_for_terms(terms):d}",
-                f"{rgmed:.3f}",
+                f"{rows:d}",
+                f"{term_count:d}",
+                f"{deg:d}",
                 f"{fgmed:.3f}",
-                f"{rsmed:.3f}",
                 f"{fsmed:.3f}",
-                f"{rgmed / fgmed:.2f}x",
-                f"{rgmed / fsmed:.2f}x",
-                str(tuple(rgout.shape)),
+                f"{speedup:.2f}x",
+                f"{fgp90:.3f}",
+                f"{fsp90:.3f}",
+                f"{generic_mpts:.2f}",
+                f"{spec_mpts:.2f}",
+                str(tuple(fgout.shape)),
             ]
-
             print(fmt_row(row, widths))
 
         print()

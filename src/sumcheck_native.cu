@@ -135,32 +135,32 @@ struct DeviceBuffer {
     }
 };
 
-enum class EvalKernelVariant {
+enum class SpecEvalStrategy {
     kBaselineShared = 0,
     kMleTiledShared = 1,
     kMleTiledWarp = 2,
     kMleTiledReduceIntrinsics = 3,
 };
 
-EvalKernelVariant select_eval_variant() {
+SpecEvalStrategy select_spec_eval_strategy() {
     const char* env = std::getenv("SC_EVAL_VARIANT");
     if (env == nullptr) {
-        return EvalKernelVariant::kBaselineShared;
+        return SpecEvalStrategy::kBaselineShared;
     }
     const std::string value(env);
     if (value == "baseline" || value == "shared") {
-        return EvalKernelVariant::kBaselineShared;
+        return SpecEvalStrategy::kBaselineShared;
     }
     if (value == "mle_tiled" || value == "mle_tiled_shared" || value == "tile") {
-        return EvalKernelVariant::kMleTiledShared;
+        return SpecEvalStrategy::kMleTiledShared;
     }
     if (value == "mle_tiled_warp" || value == "warp" || value == "shuffle") {
-        return EvalKernelVariant::kMleTiledWarp;
+        return SpecEvalStrategy::kMleTiledWarp;
     }
     if (value == "mle_tiled_reduce" || value == "reduce" || value == "intrinsics") {
-        return EvalKernelVariant::kMleTiledReduceIntrinsics;
+        return SpecEvalStrategy::kMleTiledReduceIntrinsics;
     }
-    return EvalKernelVariant::kBaselineShared;
+    return SpecEvalStrategy::kBaselineShared;
 }
 
 inline uint64_t make_barrett_mu_u32_host(uint32_t q) {
@@ -234,30 +234,30 @@ __device__ __forceinline__ uint32_t mle_update_u32_dev(
 constexpr int kEvalTStride = 4;
 constexpr int kMleItemsPerThread = 4;
 
-inline int eval_threads_for_variant(EvalKernelVariant variant) {
-    return (variant == EvalKernelVariant::kBaselineShared) ? 256 : 128;
+inline int eval_threads_for_strategy(SpecEvalStrategy variant) {
+    return (variant == SpecEvalStrategy::kBaselineShared) ? 256 : 128;
 }
 
-inline uint64_t eval_items_per_block(EvalKernelVariant variant, int eval_threads) {
-    if (variant == EvalKernelVariant::kBaselineShared) {
+inline uint64_t eval_items_per_block_for_strategy(SpecEvalStrategy variant, int eval_threads) {
+    if (variant == SpecEvalStrategy::kBaselineShared) {
         return static_cast<uint64_t>(eval_threads);
     }
     return static_cast<uint64_t>(eval_threads) * static_cast<uint64_t>(kMleItemsPerThread);
 }
 
 inline size_t eval_shared_bytes_for_variant(
-    EvalKernelVariant variant,
+    SpecEvalStrategy variant,
     int eval_threads,
     int32_t n_terms,
     int32_t total_term_vars) {
     const size_t metadata_bytes = static_cast<size_t>(n_terms + 1 + total_term_vars) * sizeof(int32_t);
-    if (variant == EvalKernelVariant::kBaselineShared ||
-        variant == EvalKernelVariant::kMleTiledShared) {
+    if (variant == SpecEvalStrategy::kBaselineShared ||
+        variant == SpecEvalStrategy::kMleTiledShared) {
         return static_cast<size_t>(kEvalTStride) * static_cast<size_t>(eval_threads) * sizeof(uint32_t) +
                metadata_bytes;
     }
     const size_t warp_count = static_cast<size_t>((eval_threads + 31) / 32);
-    if (variant == EvalKernelVariant::kMleTiledWarp) {
+    if (variant == SpecEvalStrategy::kMleTiledWarp) {
         return static_cast<size_t>(kEvalTStride) * warp_count * sizeof(uint32_t) + metadata_bytes;
     }
     return static_cast<size_t>(kEvalTStride) * warp_count * sizeof(uint64_t) + metadata_bytes;
@@ -961,9 +961,9 @@ int gpu_sumcheck_u32(
     const int32_t total_term_vars = term_offsets[n_terms];
     const int32_t t_count = max_degree + 1;
     const uint64_t q_recip = make_barrett_mu_u32_host(q);
-    const EvalKernelVariant eval_variant = select_eval_variant();
-    const int eval_threads = eval_threads_for_variant(eval_variant);
-    const uint64_t eval_block_items = eval_items_per_block(eval_variant, eval_threads);
+    const SpecEvalStrategy eval_strategy = select_spec_eval_strategy();
+    const int eval_threads = eval_threads_for_strategy(eval_strategy);
+    const uint64_t eval_block_items = eval_items_per_block_for_strategy(eval_strategy, eval_threads);
     const int reduce_threads = 256;
 
     std::vector<DeviceBuffer<uint32_t>> d_tables(static_cast<size_t>(n_inputs));
@@ -1043,13 +1043,13 @@ int gpu_sumcheck_u32(
                                  static_cast<unsigned int>(t_tiles),
                                  1U);
             const size_t eval_shared_bytes = eval_shared_bytes_for_variant(
-                eval_variant,
+                eval_strategy,
                 eval_threads,
                 n_terms,
                 total_term_vars);
 
-            switch (eval_variant) {
-                case EvalKernelVariant::kBaselineShared:
+            switch (eval_strategy) {
+                case SpecEvalStrategy::kBaselineShared:
                     eval_round_sums_u32_kernel<<<eval_grid, eval_threads, eval_shared_bytes>>>(
                         reinterpret_cast<const uint32_t* const*>(d_table_ptrs.get()),
                         n_inputs,
@@ -1066,7 +1066,7 @@ int gpu_sumcheck_u32(
                         return 1;
                     }
                     break;
-                case EvalKernelVariant::kMleTiledShared:
+                case SpecEvalStrategy::kMleTiledShared:
                     eval_round_sums_u32_mle_tiled_kernel<false><<<eval_grid, eval_threads, eval_shared_bytes>>>(
                         reinterpret_cast<const uint32_t* const*>(d_table_ptrs.get()),
                         n_inputs,
@@ -1083,7 +1083,7 @@ int gpu_sumcheck_u32(
                         return 1;
                     }
                     break;
-                case EvalKernelVariant::kMleTiledWarp:
+                case SpecEvalStrategy::kMleTiledWarp:
                     eval_round_sums_u32_mle_tiled_kernel<true><<<eval_grid, eval_threads, eval_shared_bytes>>>(
                         reinterpret_cast<const uint32_t* const*>(d_table_ptrs.get()),
                         n_inputs,
@@ -1100,7 +1100,7 @@ int gpu_sumcheck_u32(
                         return 1;
                     }
                     break;
-                case EvalKernelVariant::kMleTiledReduceIntrinsics:
+                case SpecEvalStrategy::kMleTiledReduceIntrinsics:
                     eval_round_sums_u32_mle_tiled_reduce_intrinsics_kernel<<<eval_grid, eval_threads, eval_shared_bytes>>>(
                         reinterpret_cast<const uint32_t* const*>(d_table_ptrs.get()),
                         n_inputs,
@@ -1128,7 +1128,7 @@ int gpu_sumcheck_u32(
                 const dim3 reduce_grid(static_cast<unsigned int>(reduce_blocks),
                                        static_cast<unsigned int>(t_count),
                                        1U);
-                if (eval_variant == EvalKernelVariant::kMleTiledReduceIntrinsics) {
+                if (eval_strategy == SpecEvalStrategy::kMleTiledReduceIntrinsics) {
                     const size_t reduce_shared_bytes =
                         static_cast<size_t>((reduce_threads + 31) / 32) * sizeof(uint64_t);
                     reduce_rows_u32_intrinsics_kernel<<<reduce_grid, reduce_threads, reduce_shared_bytes>>>(
@@ -1322,9 +1322,9 @@ std::tuple<torch::Tensor, torch::Tensor> torch_sumcheck_terms_u32_cuda(
     auto d_term_vars_t = term_vars_cpu.to(eval_tables.device(), torch::kInt32, false, true);
 
     const uint64_t q_recip = make_barrett_mu_u32_host(q);
-    const EvalKernelVariant eval_variant = select_eval_variant();
-    const int eval_threads = eval_threads_for_variant(eval_variant);
-    const uint64_t eval_block_items = eval_items_per_block(eval_variant, eval_threads);
+    const SpecEvalStrategy eval_strategy = select_spec_eval_strategy();
+    const int eval_threads = eval_threads_for_strategy(eval_strategy);
+    const uint64_t eval_block_items = eval_items_per_block_for_strategy(eval_strategy, eval_threads);
     const int reduce_threads = 256;
 
     uint64_t current_len = n;
@@ -1333,15 +1333,15 @@ std::tuple<torch::Tensor, torch::Tensor> torch_sumcheck_terms_u32_cuda(
         const int blocks_eval = static_cast<int>((half + eval_block_items - 1ULL) / eval_block_items);
         const int t_tiles = (t_count + kEvalTStride - 1) / kEvalTStride;
         const dim3 eval_grid(static_cast<unsigned int>(blocks_eval), static_cast<unsigned int>(t_tiles), 1U);
-        const size_t eval_shared_bytes = eval_shared_bytes_for_variant(eval_variant, eval_threads, n_terms, total_term_vars);
+        const size_t eval_shared_bytes = eval_shared_bytes_for_variant(eval_strategy, eval_threads, n_terms, total_term_vars);
 
         auto d_block_sums_a = torch::empty({t_count, blocks_eval}, options);
         auto d_block_sums_b = torch::empty({t_count, blocks_eval}, options);
         uint32_t* a_ptr = reinterpret_cast<uint32_t*>(d_block_sums_a.data_ptr());
         uint32_t* b_ptr = reinterpret_cast<uint32_t*>(d_block_sums_b.data_ptr());
 
-        switch (eval_variant) {
-            case EvalKernelVariant::kBaselineShared:
+        switch (eval_strategy) {
+            case SpecEvalStrategy::kBaselineShared:
                 eval_round_sums_u32_kernel<<<eval_grid, eval_threads, eval_shared_bytes, stream>>>(
                     reinterpret_cast<const uint32_t* const*>(d_table_ptrs.get()),
                     n_inputs,
@@ -1355,7 +1355,7 @@ std::tuple<torch::Tensor, torch::Tensor> torch_sumcheck_terms_u32_cuda(
                     q_recip,
                     a_ptr);
                 break;
-            case EvalKernelVariant::kMleTiledShared:
+            case SpecEvalStrategy::kMleTiledShared:
                 eval_round_sums_u32_mle_tiled_kernel<false><<<eval_grid, eval_threads, eval_shared_bytes, stream>>>(
                     reinterpret_cast<const uint32_t* const*>(d_table_ptrs.get()),
                     n_inputs,
@@ -1369,7 +1369,7 @@ std::tuple<torch::Tensor, torch::Tensor> torch_sumcheck_terms_u32_cuda(
                     q_recip,
                     a_ptr);
                 break;
-            case EvalKernelVariant::kMleTiledWarp:
+            case SpecEvalStrategy::kMleTiledWarp:
                 eval_round_sums_u32_mle_tiled_kernel<true><<<eval_grid, eval_threads, eval_shared_bytes, stream>>>(
                     reinterpret_cast<const uint32_t* const*>(d_table_ptrs.get()),
                     n_inputs,
@@ -1383,7 +1383,7 @@ std::tuple<torch::Tensor, torch::Tensor> torch_sumcheck_terms_u32_cuda(
                     q_recip,
                     a_ptr);
                 break;
-            case EvalKernelVariant::kMleTiledReduceIntrinsics:
+            case SpecEvalStrategy::kMleTiledReduceIntrinsics:
                 eval_round_sums_u32_mle_tiled_reduce_intrinsics_kernel<<<eval_grid, eval_threads, eval_shared_bytes, stream>>>(
                     reinterpret_cast<const uint32_t* const*>(d_table_ptrs.get()),
                     n_inputs,
@@ -1408,7 +1408,7 @@ std::tuple<torch::Tensor, torch::Tensor> torch_sumcheck_terms_u32_cuda(
         while (reduce_width > 1ULL) {
             const int reduce_blocks = static_cast<int>((reduce_width + static_cast<uint64_t>(reduce_threads) - 1ULL) / static_cast<uint64_t>(reduce_threads));
             const dim3 reduce_grid(static_cast<unsigned int>(reduce_blocks), static_cast<unsigned int>(t_count), 1U);
-            if (eval_variant == EvalKernelVariant::kMleTiledReduceIntrinsics) {
+            if (eval_strategy == SpecEvalStrategy::kMleTiledReduceIntrinsics) {
                 const size_t reduce_shared_bytes = static_cast<size_t>((reduce_threads + 31) / 32) * sizeof(uint64_t);
                 reduce_rows_u32_intrinsics_kernel<<<reduce_grid, reduce_threads, reduce_shared_bytes, stream>>>(
                     reduce_in, reduce_out, reduce_width, t_count, q);

@@ -2940,7 +2940,173 @@ std::tuple<torch::Tensor, torch::Tensor> sumcheck_terms_full_mont_u32_cuda(
     return std::make_tuple(claim0, output_normal);
 }
 
+
+
+// ============================================================================
+// u64 Montgomery arithmetic experiment.
+// Field: q = 2^64 - 2^32 + 1 = 0xffffffff00000001
+//
+// This block only adds a multiplication smoke-test entrypoint first:
+//   montgomery_u64_mul_test_cuda(a, b)
+//
+// It computes (a*b mod q) using full Montgomery conversion:
+//   normal -> Montgomery -> Montgomery multiply -> normal.
+// ============================================================================
+
+namespace mont_u64_exp {
+
+using u64 = uint64_t;
+
+constexpr u64 Q64 = 0xffffffff00000001ULL;
+constexpr u64 NPRIME = 0xfffffffeffffffffULL;   // -q^{-1} mod 2^64
+constexpr u64 R2_MOD_Q = 0xfffffffe00000001ULL; // R^2 mod q
+constexpr u64 R_MINUS_Q = 0x00000000ffffffffULL;
+
+__device__ __forceinline__ u64 add_mod(u64 a, u64 b) {
+    u64 s = a + b;
+    bool carry = s < a;
+
+    if (carry) {
+        // a+b = 2^64 + s. Since q = 2^64 - R_MINUS_Q,
+        // subtracting q is equivalent to s + R_MINUS_Q.
+        s += R_MINUS_Q;
+    } else if (s >= Q64) {
+        s -= Q64;
+    }
+
+    if (s >= Q64) {
+        s -= Q64;
+    }
+    return s;
+}
+
+__device__ __forceinline__ u64 sub_mod(u64 a, u64 b) {
+    return (a >= b) ? (a - b) : (a + (Q64 - b));
+}
+
+__device__ __forceinline__ u64 redc_from_128(u64 hi, u64 lo) {
+    // Montgomery REDC for t = hi*2^64 + lo.
+    //
+    // m = lo * (-q^{-1}) mod 2^64
+    // u = (t + m*q) / 2^64
+    // if u >= q: u -= q
+    //
+    // The high-word sum can overflow by one bit because q is close to 2^64.
+    // If that happens, the 65-bit u definitely exceeds q, so subtracting q
+    // is equivalent to adding (2^64 - q) = R_MINUS_Q to the wrapped low word.
+
+    u64 m = lo * NPRIME;
+
+    u64 mq_lo = m * Q64;
+    u64 mq_hi = __umul64hi(m, Q64);
+
+    u64 sum_lo = lo + mq_lo;
+    u64 carry0 = (sum_lo < lo) ? 1ULL : 0ULL;
+
+    u64 u = hi + mq_hi;
+    bool carry1 = (u < hi);
+
+    u64 u2 = u + carry0;
+    bool carry2 = carry1 || (u2 < u);
+    u = u2;
+
+    if (carry2) {
+        u += R_MINUS_Q;
+    } else if (u >= Q64) {
+        u -= Q64;
+    }
+
+    if (u >= Q64) {
+        u -= Q64;
+    }
+
+    return u;
+}
+
+__device__ __forceinline__ u64 mont_mul(u64 a_mont, u64 b_mont) {
+    u64 lo = a_mont * b_mont;
+    u64 hi = __umul64hi(a_mont, b_mont);
+    return redc_from_128(hi, lo);
+}
+
+__device__ __forceinline__ u64 to_mont(u64 a) {
+    // aR mod q = MontMul(a, R^2 mod q)
+    return mont_mul(a, R2_MOD_Q);
+}
+
+__device__ __forceinline__ u64 from_mont(u64 a_mont) {
+    // a = MontMul(aR, 1)
+    return redc_from_128(0, a_mont);
+}
+
+__device__ __forceinline__ u64 mul_normal(u64 a, u64 b) {
+    u64 am = to_mont(a);
+    u64 bm = to_mont(b);
+    u64 cm = mont_mul(am, bm);
+    return from_mont(cm);
+}
+
+__global__ void mul_test_kernel(
+    const u64* __restrict__ a,
+    const u64* __restrict__ b,
+    u64* __restrict__ out,
+    size_t n) {
+
+    for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < n;
+         i += static_cast<size_t>(gridDim.x) * blockDim.x) {
+        out[i] = mul_normal(a[i], b[i]);
+    }
+}
+
+} // namespace mont_u64_exp
+
+torch::Tensor montgomery_u64_mul_test_cuda(torch::Tensor a, torch::Tensor b) {
+    using namespace mont_u64_exp;
+
+    if (!a.is_cuda() || !b.is_cuda()) {
+        throw std::invalid_argument("a and b must be CUDA tensors");
+    }
+    if (a.scalar_type() != torch::kUInt64 || b.scalar_type() != torch::kUInt64) {
+        throw std::invalid_argument("a and b must be torch.uint64");
+    }
+    if (a.sizes() != b.sizes()) {
+        throw std::invalid_argument("a and b must have the same shape");
+    }
+
+    const c10::cuda::CUDAGuard device_guard(a.device());
+
+    auto aa = a.contiguous();
+    auto bb = b.contiguous();
+    auto out = torch::empty_like(aa);
+
+    constexpr int THREADS = 128;
+    constexpr int MAX_BLOCKS = 4096;
+
+    size_t n = static_cast<size_t>(aa.numel());
+    int blocks = std::min<int>(
+        MAX_BLOCKS,
+        std::max<int>(1, static_cast<int>((n + THREADS - 1) / THREADS))
+    );
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    mul_test_kernel<<<blocks, THREADS, 0, stream>>>(
+        reinterpret_cast<const u64*>(aa.data_ptr<uint64_t>()),
+        reinterpret_cast<const u64*>(bb.data_ptr<uint64_t>()),
+        reinterpret_cast<u64*>(out.data_ptr<uint64_t>()),
+        n);
+
+    hp_spec::check_last_cuda("montgomery_u64_mul_test_cuda");
+
+    return out;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("montgomery_u64_mul_test_cuda",
+          &montgomery_u64_mul_test_cuda,
+          "u64 Montgomery modular multiplication smoke test");
+
     m.def("sumcheck_terms_u32_cuda", &torch_sumcheck_terms_u32_cuda,
           "Uploaded-base u32 SumCheck over arbitrary product-term expressions");
     m.def("sumcheck_terms_full_mont_u32_cuda",

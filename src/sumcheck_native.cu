@@ -164,6 +164,55 @@ enum PolyTemplateId : int {
     kPolyAdvancedAbcgPlusDeg = 14,
 };
 
+struct PolyTemplateMeta {
+    int degree;
+    int rows;
+    const char* name;
+};
+
+inline PolyTemplateMeta meta_for_poly(int poly_id) {
+    switch (poly_id) {
+        case kPolyVanillaGate:
+            return {3, 8, "vanilla_gate"};
+        case kPolyVanillaZero:
+            return {4, 9, "vanilla_zero"};
+        case kPolyVanillaPerm:
+            return {5, 11, "vanilla_perm"};
+        case kPolyOpencheck6:
+            return {1, 6, "opencheck_6"};
+
+        case kPolyDegreeSweepDeg3:
+            return {3, 6, "degree_sweep_deg3"};
+        case kPolyDegreeSweepDeg5:
+            return {5, 6, "degree_sweep_deg5"};
+        case kPolyDegreeSweepDeg7:
+            return {7, 6, "degree_sweep_deg7"};
+
+        case kPolyBaselineLinear:
+            return {1, 1, "baseline_linear"};
+        case kPolyBaselineMul:
+            return {2, 2, "baseline_mul"};
+        case kPolyBaselineMulAdd:
+            return {2, 3, "baseline_mul_add"};
+        case kPolyBaselineCubicProduct:
+            return {3, 3, "baseline_cubic_product"};
+
+        case kPolyAdvancedA2B2C:
+            return {5, 3, "advanced_a2b2c"};
+        case kPolyAdvancedAbcPlusDe:
+            return {3, 5, "advanced_abc_plus_de"};
+        case kPolyAdvancedAbcgPlusDeg:
+            return {4, 6, "advanced_abcg_plus_deg"};
+
+        default:
+            TORCH_CHECK(false, "unsupported fixed-template poly_id: ", poly_id);
+    }
+
+    return {-1, -1, "unsupported"};
+}
+
+
+
 
 
 SpecEvalStrategy select_spec_eval_strategy() {
@@ -1931,43 +1980,11 @@ __global__ void update_kernel(
 }
 
 int degree_for_poly(int poly_id) {
-    switch (poly_id) {
-        case kPolyVanillaGate: return 3; // vanilla_gate
-        case kPolyVanillaZero: return 4; // vanilla_zero
-        case kPolyVanillaPerm: return 5; // vanilla_perm
-        case kPolyOpencheck6: return 1; // opencheck_6
-        case kPolyDegreeSweepDeg3: return 3; // custom_gate_deg3
-        case kPolyDegreeSweepDeg5: return 5; // custom_gate_deg5
-        case kPolyDegreeSweepDeg7: return 7; // custom_gate_deg7
-        case kPolyBaselineLinear: return 1; // baseline_linear: a
-        case kPolyBaselineMul: return 2; // baseline_mul: a*b
-        case kPolyBaselineMulAdd: return 2; // baseline_mul_add: a*b+c
-        case kPolyBaselineCubicProduct: return 3; // baseline_cubic_product: a*b*c
-        case kPolyAdvancedA2B2C: return 5; // advanced_a2b2c
-        case kPolyAdvancedAbcPlusDe: return 3; // advanced_abc_plus_de
-        case kPolyAdvancedAbcgPlusDeg: return 4; // advanced_abcg_plus_deg
-        default: throw std::invalid_argument("unknown HyperPlonk poly_id");
-    }
+    return meta_for_poly(poly_id).degree;
 }
 
 int rows_for_poly(int poly_id) {
-    switch (poly_id) {
-        case kPolyVanillaGate: return 8;
-        case kPolyVanillaZero: return 9;
-        case kPolyVanillaPerm: return 11;
-        case kPolyOpencheck6: return 6;
-        case kPolyDegreeSweepDeg3: return 6;
-        case kPolyDegreeSweepDeg5: return 6;
-        case kPolyDegreeSweepDeg7: return 6;
-        case kPolyBaselineLinear: return 1;
-        case kPolyBaselineMul: return 2;
-        case kPolyBaselineMulAdd: return 3;
-        case kPolyBaselineCubicProduct: return 3;
-        case kPolyAdvancedA2B2C: return 3; // advanced_a2b2c rows
-        case kPolyAdvancedAbcPlusDe: return 5; // advanced_abc_plus_de rows
-        case kPolyAdvancedAbcgPlusDeg: return 6; // advanced_abcg_plus_deg rows
-        default: throw std::invalid_argument("unknown HyperPlonk poly_id");
-    }
+    return meta_for_poly(poly_id).rows;
 }
 
 bool is_power_of_two_i64(int64_t x) {

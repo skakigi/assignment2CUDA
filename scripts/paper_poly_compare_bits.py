@@ -201,6 +201,7 @@ def main():
 
     headers = [
         "template",
+        "function",
         "N",
         "rows",
         "terms",
@@ -215,7 +216,7 @@ def main():
         "shape",
     ]
 
-    widths = [24, 10, 5, 5, 4, 12, 10, 8, 12, 10, 15, 13, 12]
+    widths = [24, 64, 10, 5, 5, 4, 12, 10, 8, 12, 10, 15, 13, 12]
 
     for bits in bits_list:
         print()
@@ -260,8 +261,11 @@ def main():
                 generic_mpts = (n / gmed) / 1000.0
                 spec_mpts = (n / smed) / 1000.0
 
+                function = getattr(base, "FUNCTIONS", {}).get(poly, poly)
+
                 row = [
                     poly,
+                    function,
                     f"{n:d}",
                     f"{base.rows_for_terms(terms):d}",
                     f"{len(terms):d}",

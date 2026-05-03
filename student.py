@@ -99,6 +99,12 @@ def _native_sumcheck(eval_tables, challenges, modulus: int):
     tables = _torch_to_uint64_cuda(eval_tables, eval_tables.device)
     rs = challenges if isinstance(challenges, torch.Tensor) else torch.as_tensor(challenges)
     rs = _torch_to_uint64_cuda(rs, eval_tables.device)
+    # Some benchmark-focused builds export only the explicit u32/u64/u128
+    # entry points, not the legacy simple `sumcheck_cuda` API.
+    # Keep this consistent with the other native paths: use native only
+    # when the expected symbol exists, otherwise fall back to reference.
+    if not hasattr(native, "sumcheck_cuda"):
+        return None
     return native.sumcheck_cuda(tables, rs, int(modulus))
 
 

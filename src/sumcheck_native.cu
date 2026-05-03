@@ -242,16 +242,36 @@ SpecEvalStrategy select_spec_eval_strategy() {
     return SpecEvalStrategy::kBaselineShared;
 }
 
+inline bool supports_compiled_template_for_poly(int poly_id) {
+    // Compiled-template kernels are enabled one polynomial at a time.
+    // This intentionally returns false until a compiled kernel is added.
+    (void)poly_id;
+    return false;
+}
+
 inline SpecEvalStrategy resolve_spec_eval_strategy_for_launch(
+    SpecEvalStrategy selected,
+    int poly_id) {
+    // `compiled` is now a first-class strategy, but it only routes to
+    // compiled kernels for templates explicitly marked as supported.
+    if (selected == SpecEvalStrategy::kCompiledTemplate &&
+        !supports_compiled_template_for_poly(poly_id)) {
+        return SpecEvalStrategy::kBaselineShared;
+    }
+    return selected;
+}
+
+inline SpecEvalStrategy resolve_spec_eval_strategy_for_launch_no_poly(
     SpecEvalStrategy selected) {
-    // Architectural placeholder: `compiled` is a first-class strategy name,
-    // but compiled-template kernels are added in a later commit.
-    // Until then, keep behavior identical by using the existing baseline path.
+    // Generic/non-fixed-template paths do not have a fixed poly_id.
+    // Treat compiled as baseline until compiled support is only used by
+    // fixed-template dispatch.
     if (selected == SpecEvalStrategy::kCompiledTemplate) {
         return SpecEvalStrategy::kBaselineShared;
     }
     return selected;
 }
+
 
 
 inline uint64_t make_barrett_mu_u32_host(uint32_t q) {
@@ -1054,7 +1074,7 @@ int gpu_sumcheck_u32(
     const uint64_t q_recip = make_barrett_mu_u32_host(q);
     const SpecEvalStrategy selected_eval_strategy = select_spec_eval_strategy();
     const SpecEvalStrategy eval_strategy =
-        resolve_spec_eval_strategy_for_launch(selected_eval_strategy);
+        resolve_spec_eval_strategy_for_launch_no_poly(selected_eval_strategy);
     const int eval_threads = eval_threads_for_strategy(eval_strategy);
     const uint64_t eval_block_items = eval_items_per_block_for_strategy(eval_strategy, eval_threads);
     const int reduce_threads = 256;
@@ -1417,7 +1437,7 @@ std::tuple<torch::Tensor, torch::Tensor> torch_sumcheck_terms_u32_cuda(
     const uint64_t q_recip = make_barrett_mu_u32_host(q);
     const SpecEvalStrategy selected_eval_strategy = select_spec_eval_strategy();
     const SpecEvalStrategy eval_strategy =
-        resolve_spec_eval_strategy_for_launch(selected_eval_strategy);
+        resolve_spec_eval_strategy_for_launch_no_poly(selected_eval_strategy);
     const int eval_threads = eval_threads_for_strategy(eval_strategy);
     const uint64_t eval_block_items = eval_items_per_block_for_strategy(eval_strategy, eval_threads);
     const int reduce_threads = 256;

@@ -1726,6 +1726,298 @@ __device__ __forceinline__ u32 warp_reduce_add_mod(u32 value, u32 q) {
     return value;
 }
 
+
+__device__ __forceinline__ void load_z_delta(
+    const u32* __restrict__ tables,
+    int len,
+    int row,
+    int idx,
+    int half,
+    u32 q,
+    u32& v,
+    u32& d) {
+
+    const u32* r = tables + static_cast<size_t>(row) * static_cast<size_t>(len);
+    v = r[idx];
+    d = sub_mod(r[idx + half], v, q);
+}
+
+__device__ __forceinline__ void advance_line(u32& v, u32 d, u32 q) {
+    v = add_mod(v, d, q);
+}
+
+__device__ __forceinline__ void eval_poly_all_x_reuse(
+    const u32* __restrict__ tables,
+    int len,
+    int idx,
+    int half,
+    int poly_id,
+    int degree,
+    u32 q,
+    u32 out[8]) {
+
+    #pragma unroll
+    for (int x = 0; x < 8; ++x) {
+        out[x] = 0;
+    }
+
+    // baseline_linear: a
+    if (poly_id == 8) {
+        u32 a, da;
+        load_z_delta(tables, len, 0, idx, half, q, a, da);
+
+        for (int x = 0; x <= degree; ++x) {
+            out[x] = a;
+            advance_line(a, da, q);
+        }
+        return;
+    }
+
+    // baseline_mul: a*b
+    if (poly_id == 9) {
+        u32 a, da, b, db;
+        load_z_delta(tables, len, 0, idx, half, q, a, da);
+        load_z_delta(tables, len, 1, idx, half, q, b, db);
+
+        for (int x = 0; x <= degree; ++x) {
+            out[x] = prod2(a, b, q);
+            advance_line(a, da, q);
+            advance_line(b, db, q);
+        }
+        return;
+    }
+
+    // baseline_mul_add: a*b + c
+    if (poly_id == 10) {
+        u32 a, da, b, db, c, dc;
+        load_z_delta(tables, len, 0, idx, half, q, a, da);
+        load_z_delta(tables, len, 1, idx, half, q, b, db);
+        load_z_delta(tables, len, 2, idx, half, q, c, dc);
+
+        for (int x = 0; x <= degree; ++x) {
+            out[x] = add_mod(prod2(a, b, q), c, q);
+            advance_line(a, da, q);
+            advance_line(b, db, q);
+            advance_line(c, dc, q);
+        }
+        return;
+    }
+
+    // baseline_cubic_product: a*b*c
+    if (poly_id == 11) {
+        u32 a, da, b, db, c, dc;
+        load_z_delta(tables, len, 0, idx, half, q, a, da);
+        load_z_delta(tables, len, 1, idx, half, q, b, db);
+        load_z_delta(tables, len, 2, idx, half, q, c, dc);
+
+        for (int x = 0; x <= degree; ++x) {
+            out[x] = prod3(a, b, c, q);
+            advance_line(a, da, q);
+            advance_line(b, db, q);
+            advance_line(c, dc, q);
+        }
+        return;
+    }
+
+    // vanilla_gate:
+    // qL*w1 + qR*w2 + qM*w1*w2 + neg_qO*w3 + qC
+    if (poly_id == 0) {
+        u32 qL, dqL, w1, dw1, qR, dqR, w2, dw2;
+        u32 qM, dqM, nqO, dnqO, w3, dw3, qC, dqC;
+
+        load_z_delta(tables, len, 0, idx, half, q, qL, dqL);
+        load_z_delta(tables, len, 1, idx, half, q, w1, dw1);
+        load_z_delta(tables, len, 2, idx, half, q, qR, dqR);
+        load_z_delta(tables, len, 3, idx, half, q, w2, dw2);
+        load_z_delta(tables, len, 4, idx, half, q, qM, dqM);
+        load_z_delta(tables, len, 5, idx, half, q, nqO, dnqO);
+        load_z_delta(tables, len, 6, idx, half, q, w3, dw3);
+        load_z_delta(tables, len, 7, idx, half, q, qC, dqC);
+
+        for (int x = 0; x <= degree; ++x) {
+            u32 acc = 0;
+            acc = add_mod(acc, prod2(qL, w1, q), q);
+            acc = add_mod(acc, prod2(qR, w2, q), q);
+            acc = add_mod(acc, prod3(qM, w1, w2, q), q);
+            acc = add_mod(acc, prod2(nqO, w3, q), q);
+            acc = add_mod(acc, qC, q);
+            out[x] = acc;
+
+            advance_line(qL, dqL, q);
+            advance_line(w1, dw1, q);
+            advance_line(qR, dqR, q);
+            advance_line(w2, dw2, q);
+            advance_line(qM, dqM, q);
+            advance_line(nqO, dnqO, q);
+            advance_line(w3, dw3, q);
+            advance_line(qC, dqC, q);
+        }
+        return;
+    }
+
+    // vanilla_zero = vanilla_gate * fr, termwise.
+    if (poly_id == 1) {
+        u32 qL, dqL, w1, dw1, qR, dqR, w2, dw2;
+        u32 qM, dqM, nqO, dnqO, w3, dw3, qC, dqC, fr, dfr;
+
+        load_z_delta(tables, len, 0, idx, half, q, qL, dqL);
+        load_z_delta(tables, len, 1, idx, half, q, w1, dw1);
+        load_z_delta(tables, len, 2, idx, half, q, qR, dqR);
+        load_z_delta(tables, len, 3, idx, half, q, w2, dw2);
+        load_z_delta(tables, len, 4, idx, half, q, qM, dqM);
+        load_z_delta(tables, len, 5, idx, half, q, nqO, dnqO);
+        load_z_delta(tables, len, 6, idx, half, q, w3, dw3);
+        load_z_delta(tables, len, 7, idx, half, q, qC, dqC);
+        load_z_delta(tables, len, 8, idx, half, q, fr, dfr);
+
+        for (int x = 0; x <= degree; ++x) {
+            u32 acc = 0;
+            acc = add_mod(acc, prod3(qL, w1, fr, q), q);
+            acc = add_mod(acc, prod3(qR, w2, fr, q), q);
+            acc = add_mod(acc, prod4(qM, w1, w2, fr, q), q);
+            acc = add_mod(acc, prod3(nqO, w3, fr, q), q);
+            acc = add_mod(acc, prod2(qC, fr, q), q);
+            out[x] = acc;
+
+            advance_line(qL, dqL, q);
+            advance_line(w1, dw1, q);
+            advance_line(qR, dqR, q);
+            advance_line(w2, dw2, q);
+            advance_line(qM, dqM, q);
+            advance_line(nqO, dnqO, q);
+            advance_line(w3, dw3, q);
+            advance_line(qC, dqC, q);
+            advance_line(fr, dfr, q);
+        }
+        return;
+    }
+
+    // vanilla_perm:
+    // (pi - p1*p2 + alpha_phi*D1*D2*D3 - alpha*N1*N2*N3) * fr
+    // signs/scalars folded into rows
+    if (poly_id == 2) {
+        u32 pi, dpi, np1, dnp1, p2, dp2, aphi, daphi;
+        u32 D1, dD1, D2, dD2, D3, dD3;
+        u32 nalphaN1, dnalphaN1, N2, dN2, N3, dN3, fr, dfr;
+
+        load_z_delta(tables, len, 0, idx, half, q, pi, dpi);
+        load_z_delta(tables, len, 1, idx, half, q, np1, dnp1);
+        load_z_delta(tables, len, 2, idx, half, q, p2, dp2);
+        load_z_delta(tables, len, 3, idx, half, q, aphi, daphi);
+        load_z_delta(tables, len, 4, idx, half, q, D1, dD1);
+        load_z_delta(tables, len, 5, idx, half, q, D2, dD2);
+        load_z_delta(tables, len, 6, idx, half, q, D3, dD3);
+        load_z_delta(tables, len, 7, idx, half, q, nalphaN1, dnalphaN1);
+        load_z_delta(tables, len, 8, idx, half, q, N2, dN2);
+        load_z_delta(tables, len, 9, idx, half, q, N3, dN3);
+        load_z_delta(tables, len, 10, idx, half, q, fr, dfr);
+
+        for (int x = 0; x <= degree; ++x) {
+            u32 acc = 0;
+            acc = add_mod(acc, prod2(pi, fr, q), q);
+            acc = add_mod(acc, prod3(np1, p2, fr, q), q);
+            acc = add_mod(acc, prod5(aphi, D1, D2, D3, fr, q), q);
+            acc = add_mod(acc, prod4(nalphaN1, N2, N3, fr, q), q);
+            out[x] = acc;
+
+            advance_line(pi, dpi, q);
+            advance_line(np1, dnp1, q);
+            advance_line(p2, dp2, q);
+            advance_line(aphi, daphi, q);
+            advance_line(D1, dD1, q);
+            advance_line(D2, dD2, q);
+            advance_line(D3, dD3, q);
+            advance_line(nalphaN1, dnalphaN1, q);
+            advance_line(N2, dN2, q);
+            advance_line(N3, dN3, q);
+            advance_line(fr, dfr, q);
+        }
+        return;
+    }
+
+    // opencheck_6: y1*k1 + ... + y6*k6, coefficients folded into rows.
+    if (poly_id == 3) {
+        u32 v0, d0, v1, d1, v2, d2, v3, d3, v4, d4, v5, d5;
+
+        load_z_delta(tables, len, 0, idx, half, q, v0, d0);
+        load_z_delta(tables, len, 1, idx, half, q, v1, d1);
+        load_z_delta(tables, len, 2, idx, half, q, v2, d2);
+        load_z_delta(tables, len, 3, idx, half, q, v3, d3);
+        load_z_delta(tables, len, 4, idx, half, q, v4, d4);
+        load_z_delta(tables, len, 5, idx, half, q, v5, d5);
+
+        for (int x = 0; x <= degree; ++x) {
+            u32 acc = 0;
+            acc = add_mod(acc, v0, q);
+            acc = add_mod(acc, v1, q);
+            acc = add_mod(acc, v2, q);
+            acc = add_mod(acc, v3, q);
+            acc = add_mod(acc, v4, q);
+            acc = add_mod(acc, v5, q);
+            out[x] = acc;
+
+            advance_line(v0, d0, q);
+            advance_line(v1, d1, q);
+            advance_line(v2, d2, q);
+            advance_line(v3, d3, q);
+            advance_line(v4, d4, q);
+            advance_line(v5, d5, q);
+        }
+        return;
+    }
+
+    // degree_sweep_deg3/5/7:
+    // q1*w1 + q2*w2 + qH*w1^k*w2 + qC
+    if (poly_id == 5 || poly_id == 6 || poly_id == 7) {
+        u32 q1, dq1, w1, dw1, q2, dq2, w2, dw2, qH, dqH, qC, dqC;
+
+        load_z_delta(tables, len, 0, idx, half, q, q1, dq1);
+        load_z_delta(tables, len, 1, idx, half, q, w1, dw1);
+        load_z_delta(tables, len, 2, idx, half, q, q2, dq2);
+        load_z_delta(tables, len, 3, idx, half, q, w2, dw2);
+        load_z_delta(tables, len, 4, idx, half, q, qH, dqH);
+        load_z_delta(tables, len, 5, idx, half, q, qC, dqC);
+
+        for (int x = 0; x <= degree; ++x) {
+            u32 acc = 0;
+            acc = add_mod(acc, prod2(q1, w1, q), q);
+            acc = add_mod(acc, prod2(q2, w2, q), q);
+
+            if (poly_id == 5) {
+                acc = add_mod(acc, prod3(qH, w1, w2, q), q);
+            } else if (poly_id == 6) {
+                acc = add_mod(acc, prod5(qH, w1, w1, w1, w2, q), q);
+            } else {
+                acc = add_mod(acc, prod7(qH, w1, w1, w1, w1, w1, w2, q), q);
+            }
+
+            acc = add_mod(acc, qC, q);
+            out[x] = acc;
+
+            advance_line(q1, dq1, q);
+            advance_line(w1, dw1, q);
+            advance_line(q2, dq2, q);
+            advance_line(w2, dw2, q);
+            advance_line(qH, dqH, q);
+            advance_line(qC, dqC, q);
+        }
+        return;
+    }
+
+    // Fallback for any retained legacy/poly_id case.
+    for (int x = 0; x <= degree; ++x) {
+        out[x] = eval_poly_at_x(
+            tables,
+            len,
+            idx,
+            half,
+            poly_id,
+            static_cast<u32>(x),
+            q
+        );
+    }
+}
+
 __global__ void eval_kernel(
     const u32* __restrict__ tables,
     int len,
@@ -1854,6 +2146,257 @@ __global__ void update_kernel(
 
         u32 r = challenges[round];
         out_row[i] = line_eval(in_row[i], in_row[i + half], r, q);
+    }
+}
+
+
+// ============================================================================
+// Experimental specialized + tiled + all-x MLE reuse path.
+// This keeps the existing specialized path intact and adds a third entrypoint:
+//   sumcheck_hyperplonk_tiled_u32_cuda
+// ============================================================================
+
+constexpr int REUSE_ITEMS_PER_THREAD = 4;
+constexpr int REUSE_MAX_ROWS = 19;
+
+__device__ __forceinline__ u32 eval_poly_values_reuse(
+    const u32* __restrict__ v,
+    int poly_id,
+    u32 q) {
+
+    if (poly_id == 8) {
+        // baseline_linear: a
+        return v[0];
+    }
+
+    if (poly_id == 9) {
+        // baseline_mul: a*b
+        return prod2(v[0], v[1], q);
+    }
+
+    if (poly_id == 10) {
+        // baseline_mul_add: a*b + c
+        return add_mod(prod2(v[0], v[1], q), v[2], q);
+    }
+
+    if (poly_id == 11) {
+        // baseline_cubic_product: a*b*c
+        return prod3(v[0], v[1], v[2], q);
+    }
+
+    if (poly_id == 0) {
+        // vanilla_gate:
+        // qL*w1 + qR*w2 + qM*w1*w2 + neg_qO*w3 + qC
+        u32 acc = 0;
+        acc = add_mod(acc, prod2(v[0], v[1], q), q);
+        acc = add_mod(acc, prod2(v[2], v[3], q), q);
+        acc = add_mod(acc, prod3(v[4], v[1], v[3], q), q);
+        acc = add_mod(acc, prod2(v[5], v[6], q), q);
+        acc = add_mod(acc, v[7], q);
+        return acc;
+    }
+
+    if (poly_id == 1) {
+        // vanilla_zero = vanilla_gate * fr, termwise.
+        u32 acc = 0;
+        acc = add_mod(acc, prod3(v[0], v[1], v[8], q), q);
+        acc = add_mod(acc, prod3(v[2], v[3], v[8], q), q);
+        acc = add_mod(acc, prod4(v[4], v[1], v[3], v[8], q), q);
+        acc = add_mod(acc, prod3(v[5], v[6], v[8], q), q);
+        acc = add_mod(acc, prod2(v[7], v[8], q), q);
+        return acc;
+    }
+
+    if (poly_id == 2) {
+        // vanilla_perm:
+        // (pi - p1*p2 + alpha_phi*D1*D2*D3 - alpha*N1*N2*N3) * fr
+        // Signs/scalars are folded into rows.
+        u32 acc = 0;
+        acc = add_mod(acc, prod2(v[0], v[10], q), q);
+        acc = add_mod(acc, prod3(v[1], v[2], v[10], q), q);
+        acc = add_mod(acc, prod5(v[3], v[4], v[5], v[6], v[10], q), q);
+        acc = add_mod(acc, prod4(v[7], v[8], v[9], v[10], q), q);
+        return acc;
+    }
+
+    if (poly_id == 3) {
+        // opencheck_6
+        u32 acc = 0;
+        acc = add_mod(acc, v[0], q);
+        acc = add_mod(acc, v[1], q);
+        acc = add_mod(acc, v[2], q);
+        acc = add_mod(acc, v[3], q);
+        acc = add_mod(acc, v[4], q);
+        acc = add_mod(acc, v[5], q);
+        return acc;
+    }
+
+    if (poly_id == 5) {
+        // degree_sweep_deg3:
+        // q1*w1 + q2*w2 + qH*w1*w2 + qC
+        u32 acc = 0;
+        acc = add_mod(acc, prod2(v[0], v[1], q), q);
+        acc = add_mod(acc, prod2(v[2], v[3], q), q);
+        acc = add_mod(acc, prod3(v[4], v[1], v[3], q), q);
+        acc = add_mod(acc, v[5], q);
+        return acc;
+    }
+
+    if (poly_id == 6) {
+        // degree_sweep_deg5:
+        // q1*w1 + q2*w2 + qH*w1^3*w2 + qC
+        u32 acc = 0;
+        acc = add_mod(acc, prod2(v[0], v[1], q), q);
+        acc = add_mod(acc, prod2(v[2], v[3], q), q);
+        acc = add_mod(acc, prod5(v[4], v[1], v[1], v[1], v[3], q), q);
+        acc = add_mod(acc, v[5], q);
+        return acc;
+    }
+
+    if (poly_id == 7) {
+        // degree_sweep_deg7:
+        // q1*w1 + q2*w2 + qH*w1^5*w2 + qC
+        u32 acc = 0;
+        acc = add_mod(acc, prod2(v[0], v[1], q), q);
+        acc = add_mod(acc, prod2(v[2], v[3], q), q);
+        acc = add_mod(acc, prod7(v[4], v[1], v[1], v[1], v[1], v[1], v[3], q), q);
+        acc = add_mod(acc, v[5], q);
+        return acc;
+    }
+
+    return 0;
+}
+
+__device__ __forceinline__ void eval_poly_all_x_reuse_tiled(
+    const u32* __restrict__ tables,
+    int len,
+    int idx,
+    int half,
+    int rows,
+    int poly_id,
+    int degree,
+    u32 q,
+    u32 out[8]) {
+
+    u32 v[REUSE_MAX_ROWS];
+    u32 d[REUSE_MAX_ROWS];
+
+    #pragma unroll
+    for (int r = 0; r < REUSE_MAX_ROWS; ++r) {
+        if (r < rows) {
+            const u32* row = tables + static_cast<size_t>(r) * static_cast<size_t>(len);
+            u32 z = row[idx];
+            u32 o = row[idx + half];
+            v[r] = z;
+            d[r] = sub_mod(o, z, q);
+        } else {
+            v[r] = 0;
+            d[r] = 0;
+        }
+    }
+
+    #pragma unroll
+    for (int x = 0; x < 8; ++x) {
+        out[x] = 0;
+    }
+
+    for (int x = 0; x <= degree; ++x) {
+        out[x] = eval_poly_values_reuse(v, poly_id, q);
+
+        #pragma unroll
+        for (int r = 0; r < REUSE_MAX_ROWS; ++r) {
+            if (r < rows) {
+                v[r] = add_mod(v[r], d[r], q);
+            }
+        }
+    }
+}
+
+__global__ void eval_tiled_reuse_kernel(
+    const u32* __restrict__ tables,
+    int len,
+    int rows,
+    int poly_id,
+    int degree,
+    u32 q,
+    u32* __restrict__ partials) {
+
+    extern __shared__ u32 shared[];
+
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp_id = tid >> 5;
+    const int num_warps = (blockDim.x + 31) >> 5;
+    const int half = len >> 1;
+
+    u32 local[8];
+
+    #pragma unroll
+    for (int x = 0; x < 8; ++x) {
+        local[x] = 0;
+    }
+
+    const int block_start =
+        blockIdx.x * blockDim.x * REUSE_ITEMS_PER_THREAD + tid;
+    const int grid_stride =
+        gridDim.x * blockDim.x * REUSE_ITEMS_PER_THREAD;
+
+    for (int base = block_start; base < half; base += grid_stride) {
+        #pragma unroll
+        for (int item = 0; item < REUSE_ITEMS_PER_THREAD; ++item) {
+            int i = base + item * blockDim.x;
+
+            if (i < half) {
+                u32 y_all[8];
+
+                eval_poly_all_x_reuse_tiled(
+                    tables,
+                    len,
+                    i,
+                    half,
+                    rows,
+                    poly_id,
+                    degree,
+                    q,
+                    y_all
+                );
+
+                for (int x = 0; x <= degree; ++x) {
+                    local[x] = add_mod(local[x], y_all[x], q);
+                }
+            }
+        }
+    }
+
+    // Warp-level reduction.
+    for (int x = 0; x <= degree; ++x) {
+        u32 reduced = warp_reduce_add_mod(local[x], q);
+        if (lane == 0) {
+            shared[x * num_warps + warp_id] = reduced;
+        }
+    }
+
+    __syncthreads();
+
+    // First warp reduces warp totals.
+    if (warp_id == 0) {
+        for (int x = 0; x <= degree; ++x) {
+            u32 value = 0;
+
+            if (lane < num_warps) {
+                value = shared[x * num_warps + lane];
+            }
+
+            value = warp_reduce_add_mod(value, q);
+
+            if (lane == 0) {
+                partials[
+                    static_cast<size_t>(blockIdx.x) *
+                    static_cast<size_t>(degree + 1) +
+                    x
+                ] = value;
+            }
+        }
     }
 }
 
@@ -2013,11 +2556,132 @@ torch::Tensor sumcheck_hyperplonk_u32_cuda(
 }
 
 
+
+
+torch::Tensor sumcheck_hyperplonk_tiled_u32_cuda(
+    torch::Tensor eval_tables,
+    torch::Tensor challenges,
+    uint64_t modulus,
+    int64_t poly_id_64) {
+
+    using namespace hp_spec;
+
+    int poly_id = static_cast<int>(poly_id_64);
+
+    if (poly_id == 4) {
+        throw std::invalid_argument("poly_id 4 is unused and not supported by tiled specialized path");
+    }
+
+    int degree = degree_for_poly(poly_id);
+    int rows = rows_for_poly(poly_id);
+
+    if (!eval_tables.is_cuda()) {
+        throw std::invalid_argument("eval_tables must be CUDA");
+    }
+    if (eval_tables.scalar_type() != torch::kUInt32) {
+        throw std::invalid_argument("eval_tables must be torch.uint32");
+    }
+    if (eval_tables.dim() != 2) {
+        throw std::invalid_argument("eval_tables must have shape (rows, N)");
+    }
+    if (eval_tables.size(0) < rows) {
+        throw std::invalid_argument("eval_tables has too few rows for requested poly_id");
+    }
+    if (!is_power_of_two_i64(eval_tables.size(1))) {
+        throw std::invalid_argument("N must be a power of two");
+    }
+    if (modulus > 0xffffffffULL) {
+        throw std::invalid_argument("sumcheck_hyperplonk_tiled_u32_cuda requires a u32 modulus");
+    }
+
+    const c10::cuda::CUDAGuard device_guard(eval_tables.device());
+
+    auto tables = eval_tables.narrow(0, 0, rows).contiguous();
+    auto rs = challenges.to(eval_tables.options().dtype(torch::kUInt32)).contiguous();
+
+    int initial_len = static_cast<int>(tables.size(1));
+    int rounds = log2_exact_i64(initial_len);
+
+    if (rs.dim() != 1 || rs.size(0) < rounds) {
+        throw std::invalid_argument("challenges must have shape at least (log2(N),)");
+    }
+
+    auto output = torch::empty({rounds, degree + 1}, tables.options());
+    auto current = tables;
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    u32 q = static_cast<u32>(modulus);
+
+    for (int round = 0; round < rounds; ++round) {
+        int len = static_cast<int>(current.size(1));
+        int half = len >> 1;
+
+        int blocks = std::min(
+            MAX_BLOCKS,
+            std::max(
+                1,
+                (half + THREADS * REUSE_ITEMS_PER_THREAD - 1) /
+                    (THREADS * REUSE_ITEMS_PER_THREAD)
+            )
+        );
+
+        auto partials = torch::empty({blocks, degree + 1}, tables.options());
+
+        // Over-allocate shared memory. The kernel only needs
+        // (degree + 1) * num_warps u32 values, but this keeps sizing simple.
+        size_t shmem = static_cast<size_t>(degree + 1) * THREADS * sizeof(u32);
+
+        eval_tiled_reuse_kernel<<<blocks, THREADS, shmem, stream>>>(
+            reinterpret_cast<const u32*>(current.data_ptr<uint32_t>()),
+            len,
+            rows,
+            poly_id,
+            degree,
+            q,
+            reinterpret_cast<u32*>(partials.data_ptr<uint32_t>()));
+        check_last_cuda("hp_spec eval_tiled_reuse_kernel");
+
+        reduce_kernel<<<degree + 1, THREADS, 0, stream>>>(
+            reinterpret_cast<const u32*>(partials.data_ptr<uint32_t>()),
+            blocks,
+            degree,
+            q,
+            reinterpret_cast<u32*>(output[round].data_ptr<uint32_t>()));
+        check_last_cuda("hp_spec reduce_kernel tiled");
+
+        if (round + 1 < rounds) {
+            auto next = torch::empty({rows, half}, tables.options());
+
+            int upd_blocks = std::min(
+                MAX_BLOCKS,
+                std::max(1, (rows * half + THREADS - 1) / THREADS));
+
+            update_kernel<<<upd_blocks, THREADS, 0, stream>>>(
+                reinterpret_cast<const u32*>(current.data_ptr<uint32_t>()),
+                rows,
+                len,
+                reinterpret_cast<const u32*>(rs.data_ptr<uint32_t>()),
+                round,
+                q,
+                reinterpret_cast<u32*>(next.data_ptr<uint32_t>()));
+            check_last_cuda("hp_spec update_kernel tiled");
+
+            current = next;
+        }
+    }
+
+    return output;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("sumcheck_terms_u32_cuda", &torch_sumcheck_terms_u32_cuda,
           "Uploaded-base u32 SumCheck over arbitrary product-term expressions");
     m.def("sumcheck_hyperplonk_u32_cuda",
           &sumcheck_hyperplonk_u32_cuda,
           "Specialized u32 SumCheck for fixed HyperPlonk-style polynomial templates");
+    m.def("sumcheck_hyperplonk_tiled_u32_cuda",
+          &sumcheck_hyperplonk_tiled_u32_cuda,
+          "Experimental specialized u32 SumCheck with MLE tiling and all-x reuse");
+
 
 }

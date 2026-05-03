@@ -3102,7 +3102,492 @@ torch::Tensor montgomery_u64_mul_test_cuda(torch::Tensor a, torch::Tensor b) {
     return out;
 }
 
+
+
+// ============================================================================
+// Generic u64 full Montgomery-domain SumCheck.
+// Field: q = 2^64 - 2^32 + 1.
+// This backend converts eval_tables/challenges once into Montgomery form,
+// executes every SumCheck round in Montgomery form, and converts outputs once.
+// ============================================================================
+
+namespace mont_u64_exp {
+
+constexpr u64 MONT_ONE = 0x00000000ffffffffULL; // R mod q for q = 2^64 - 2^32 + 1
+constexpr int SUMCHECK_THREADS = 128;
+constexpr int SUMCHECK_MAX_BLOCKS = 4096;
+
+__device__ __forceinline__ u64 line_eval_mont(u64 z_mont, u64 o_mont, u64 t_mont) {
+    u64 delta = sub_mod(o_mont, z_mont);
+    return add_mod(z_mont, mont_mul(t_mont, delta));
+}
+
+__device__ __forceinline__ u64 load_line_mont(
+    const u64* __restrict__ tables,
+    int len,
+    int row,
+    int idx,
+    int half,
+    u64 x_mont) {
+
+    const u64* r = tables + static_cast<size_t>(row) * static_cast<size_t>(len);
+    return line_eval_mont(r[idx], r[idx + half], x_mont);
+}
+
+__device__ __forceinline__ u64 eval_terms_at_x_mont(
+    const u64* __restrict__ tables,
+    int len,
+    int idx,
+    int half,
+    const int32_t* __restrict__ term_offsets,
+    const int32_t* __restrict__ term_vars,
+    int num_terms,
+    u64 x_mont) {
+
+    u64 acc = 0;
+
+    for (int term = 0; term < num_terms; ++term) {
+        int start = term_offsets[term];
+        int end = term_offsets[term + 1];
+
+        u64 prod = MONT_ONE;
+
+        for (int j = start; j < end; ++j) {
+            int row = term_vars[j];
+            u64 value = load_line_mont(tables, len, row, idx, half, x_mont);
+            prod = mont_mul(prod, value);
+        }
+
+        acc = add_mod(acc, prod);
+    }
+
+    return acc;
+}
+
+__device__ __forceinline__ u64 warp_reduce_add_mod_u64(u64 value) {
+    unsigned mask = 0xffffffffu;
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        u64 other = __shfl_down_sync(mask, value, offset);
+        value = add_mod(value, other);
+    }
+
+    return value;
+}
+
+__global__ void convert_to_mont_u64_kernel(
+    const u64* __restrict__ in,
+    size_t n,
+    u64* __restrict__ out) {
+
+    for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < n;
+         i += static_cast<size_t>(gridDim.x) * blockDim.x) {
+        out[i] = to_mont(in[i]);
+    }
+}
+
+__global__ void convert_from_mont_u64_kernel(
+    const u64* __restrict__ in,
+    size_t n,
+    u64* __restrict__ out) {
+
+    for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < n;
+         i += static_cast<size_t>(gridDim.x) * blockDim.x) {
+        out[i] = from_mont(in[i]);
+    }
+}
+
+__global__ void eval_terms_sumcheck_u64_kernel(
+    const u64* __restrict__ tables,
+    int len,
+    const int32_t* __restrict__ term_offsets,
+    const int32_t* __restrict__ term_vars,
+    int num_terms,
+    int degree,
+    u64* __restrict__ partials) {
+
+    extern __shared__ u64 shared[];
+
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp_id = tid >> 5;
+    const int num_warps = (blockDim.x + 31) >> 5;
+    const int half = len >> 1;
+
+    u64 local[8];
+
+    #pragma unroll
+    for (int x = 0; x < 8; ++x) {
+        local[x] = 0;
+    }
+
+    for (int i = blockIdx.x * blockDim.x + tid;
+         i < half;
+         i += blockDim.x * gridDim.x) {
+
+        for (int x = 0; x <= degree; ++x) {
+            u64 x_mont = to_mont(static_cast<u64>(x));
+
+            u64 y = eval_terms_at_x_mont(
+                tables,
+                len,
+                i,
+                half,
+                term_offsets,
+                term_vars,
+                num_terms,
+                x_mont
+            );
+
+            local[x] = add_mod(local[x], y);
+        }
+    }
+
+    for (int x = 0; x <= degree; ++x) {
+        u64 reduced = warp_reduce_add_mod_u64(local[x]);
+        if (lane == 0) {
+            shared[x * num_warps + warp_id] = reduced;
+        }
+    }
+
+    __syncthreads();
+
+    if (warp_id == 0) {
+        for (int x = 0; x <= degree; ++x) {
+            u64 value = 0;
+
+            if (lane < num_warps) {
+                value = shared[x * num_warps + lane];
+            }
+
+            value = warp_reduce_add_mod_u64(value);
+
+            if (lane == 0) {
+                partials[
+                    static_cast<size_t>(blockIdx.x) *
+                    static_cast<size_t>(degree + 1) +
+                    x
+                ] = value;
+            }
+        }
+    }
+}
+
+__global__ void reduce_sumcheck_u64_kernel(
+    const u64* __restrict__ partials,
+    int num_blocks,
+    int degree,
+    u64* __restrict__ out_round) {
+
+    __shared__ u64 scratch[SUMCHECK_THREADS];
+
+    int x = blockIdx.x;
+    int tid = threadIdx.x;
+
+    u64 acc = 0;
+
+    for (int b = tid; b < num_blocks; b += blockDim.x) {
+        acc = add_mod(
+            acc,
+            partials[
+                static_cast<size_t>(b) *
+                static_cast<size_t>(degree + 1) +
+                x
+            ]
+        );
+    }
+
+    scratch[tid] = acc;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            scratch[tid] = add_mod(scratch[tid], scratch[tid + stride]);
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        out_round[x] = scratch[0];
+    }
+}
+
+__global__ void update_sumcheck_u64_kernel(
+    const u64* __restrict__ in_tables,
+    int rows,
+    int len,
+    const u64* __restrict__ challenges_mont,
+    int round,
+    u64* __restrict__ out_tables) {
+
+    int half = len >> 1;
+    size_t total = static_cast<size_t>(rows) * static_cast<size_t>(half);
+
+    for (size_t linear = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         linear < total;
+         linear += static_cast<size_t>(gridDim.x) * blockDim.x) {
+
+        int row = static_cast<int>(linear / half);
+        int i = static_cast<int>(
+            linear - static_cast<size_t>(row) * static_cast<size_t>(half)
+        );
+
+        const u64* in_row =
+            in_tables + static_cast<size_t>(row) * static_cast<size_t>(len);
+        u64* out_row =
+            out_tables + static_cast<size_t>(row) * static_cast<size_t>(half);
+
+        u64 r_mont = challenges_mont[round];
+        out_row[i] = line_eval_mont(in_row[i], in_row[i + half], r_mont);
+    }
+}
+
+__global__ void claim0_from_output_u64_kernel(
+    const u64* __restrict__ output_normal,
+    int degree,
+    u64* __restrict__ claim0) {
+
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        if (degree >= 1) {
+            claim0[0] = add_mod(output_normal[0], output_normal[1]);
+        } else {
+            claim0[0] = output_normal[0];
+        }
+    }
+}
+
+} // namespace mont_u64_exp
+
+std::tuple<torch::Tensor, torch::Tensor> sumcheck_terms_full_mont_u64_cuda(
+    torch::Tensor eval_tables,
+    torch::Tensor challenges,
+    torch::Tensor term_offsets,
+    torch::Tensor term_vars,
+    uint64_t modulus_hi,
+    uint64_t modulus_lo) {
+
+    using namespace mont_u64_exp;
+
+    if (modulus_hi != 0 || modulus_lo != Q64) {
+        throw std::invalid_argument(
+            "u64 Montgomery SumCheck currently requires q = 2^64 - 2^32 + 1"
+        );
+    }
+
+    if (!eval_tables.is_cuda()) {
+        throw std::invalid_argument("eval_tables must be CUDA");
+    }
+    if (eval_tables.scalar_type() != torch::kUInt64) {
+        throw std::invalid_argument("eval_tables must be torch.uint64");
+    }
+    if (eval_tables.dim() != 2) {
+        throw std::invalid_argument("eval_tables must have shape (rows, N)");
+    }
+    if (!hp_spec::is_power_of_two_i64(eval_tables.size(1))) {
+        throw std::invalid_argument("N must be a power of two");
+    }
+
+    const c10::cuda::CUDAGuard device_guard(eval_tables.device());
+
+    auto offsets_cpu = term_offsets.to(torch::kCPU).to(torch::kInt32).contiguous();
+    auto vars_cpu = term_vars.to(torch::kCPU).to(torch::kInt32).contiguous();
+
+    if (offsets_cpu.dim() != 1 || offsets_cpu.size(0) < 2) {
+        throw std::invalid_argument("term_offsets must be a 1D tensor with at least 2 entries");
+    }
+    if (vars_cpu.dim() != 1) {
+        throw std::invalid_argument("term_vars must be a 1D tensor");
+    }
+
+    int num_terms = static_cast<int>(offsets_cpu.size(0)) - 1;
+    const int32_t* offsets_ptr = offsets_cpu.data_ptr<int32_t>();
+    const int32_t* vars_ptr = vars_cpu.data_ptr<int32_t>();
+
+    int degree = 0;
+    int max_row = -1;
+
+    for (int t = 0; t < num_terms; ++t) {
+        int start = offsets_ptr[t];
+        int end = offsets_ptr[t + 1];
+
+        if (start < 0 || end < start || end > vars_cpu.size(0)) {
+            throw std::invalid_argument("invalid term_offsets");
+        }
+
+        int term_degree = end - start;
+        degree = std::max(degree, term_degree);
+
+        for (int j = start; j < end; ++j) {
+            int row = vars_ptr[j];
+            if (row < 0) {
+                throw std::invalid_argument("term_vars contains a negative row index");
+            }
+            max_row = std::max(max_row, row);
+        }
+    }
+
+    if (degree > 7) {
+        throw std::invalid_argument("u64 generic path currently supports degree <= 7");
+    }
+    if (max_row >= eval_tables.size(0)) {
+        throw std::invalid_argument("term_vars references a row outside eval_tables");
+    }
+
+    int rows = static_cast<int>(eval_tables.size(0));
+    int initial_len = static_cast<int>(eval_tables.size(1));
+    int rounds = hp_spec::log2_exact_i64(initial_len);
+
+    auto normal_tables = eval_tables.contiguous();
+    auto normal_chals =
+        challenges.to(eval_tables.options().dtype(torch::kUInt64)).contiguous();
+
+    if (normal_chals.dim() != 1 || normal_chals.size(0) < rounds) {
+        throw std::invalid_argument("challenges must have shape at least (log2(N),)");
+    }
+
+    auto int_opts_dev =
+        torch::TensorOptions().device(eval_tables.device()).dtype(torch::kInt32);
+
+    auto offsets_dev = term_offsets.to(int_opts_dev).contiguous();
+    auto vars_dev = term_vars.to(int_opts_dev).contiguous();
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    auto current = torch::empty_like(normal_tables);
+    auto chals_mont = torch::empty_like(normal_chals);
+
+    int conv_threads = SUMCHECK_THREADS;
+
+    int conv_blocks_tables = std::min(
+        SUMCHECK_MAX_BLOCKS,
+        static_cast<int>(
+            std::max<int64_t>(
+                1,
+                (normal_tables.numel() + conv_threads - 1) / conv_threads
+            )
+        )
+    );
+
+    int conv_blocks_chals = std::min(
+        SUMCHECK_MAX_BLOCKS,
+        static_cast<int>(
+            std::max<int64_t>(
+                1,
+                (normal_chals.numel() + conv_threads - 1) / conv_threads
+            )
+        )
+    );
+
+    convert_to_mont_u64_kernel<<<conv_blocks_tables, conv_threads, 0, stream>>>(
+        reinterpret_cast<const u64*>(normal_tables.data_ptr<uint64_t>()),
+        static_cast<size_t>(normal_tables.numel()),
+        reinterpret_cast<u64*>(current.data_ptr<uint64_t>()));
+    hp_spec::check_last_cuda("u64 terms convert tables");
+
+    convert_to_mont_u64_kernel<<<conv_blocks_chals, conv_threads, 0, stream>>>(
+        reinterpret_cast<const u64*>(normal_chals.data_ptr<uint64_t>()),
+        static_cast<size_t>(normal_chals.numel()),
+        reinterpret_cast<u64*>(chals_mont.data_ptr<uint64_t>()));
+    hp_spec::check_last_cuda("u64 terms convert challenges");
+
+    auto output_mont =
+        torch::empty({rounds, degree + 1}, normal_tables.options());
+
+    for (int round = 0; round < rounds; ++round) {
+        int len = static_cast<int>(current.size(1));
+        int half = len >> 1;
+
+        int blocks = std::min(
+            SUMCHECK_MAX_BLOCKS,
+            std::max(1, (half + SUMCHECK_THREADS - 1) / SUMCHECK_THREADS)
+        );
+
+        auto partials =
+            torch::empty({blocks, degree + 1}, normal_tables.options());
+
+        size_t shmem =
+            static_cast<size_t>(degree + 1) *
+            SUMCHECK_THREADS *
+            sizeof(u64);
+
+        eval_terms_sumcheck_u64_kernel<<<blocks, SUMCHECK_THREADS, shmem, stream>>>(
+            reinterpret_cast<const u64*>(current.data_ptr<uint64_t>()),
+            len,
+            reinterpret_cast<const int32_t*>(offsets_dev.data_ptr<int32_t>()),
+            reinterpret_cast<const int32_t*>(vars_dev.data_ptr<int32_t>()),
+            num_terms,
+            degree,
+            reinterpret_cast<u64*>(partials.data_ptr<uint64_t>()));
+        hp_spec::check_last_cuda("u64 terms eval");
+
+        reduce_sumcheck_u64_kernel<<<degree + 1, SUMCHECK_THREADS, 0, stream>>>(
+            reinterpret_cast<const u64*>(partials.data_ptr<uint64_t>()),
+            blocks,
+            degree,
+            reinterpret_cast<u64*>(output_mont[round].data_ptr<uint64_t>()));
+        hp_spec::check_last_cuda("u64 terms reduce");
+
+        if (round + 1 < rounds) {
+            auto next = torch::empty({rows, half}, normal_tables.options());
+
+            int upd_blocks = std::min(
+                SUMCHECK_MAX_BLOCKS,
+                std::max(
+                    1,
+                    (rows * half + SUMCHECK_THREADS - 1) / SUMCHECK_THREADS
+                )
+            );
+
+            update_sumcheck_u64_kernel<<<upd_blocks, SUMCHECK_THREADS, 0, stream>>>(
+                reinterpret_cast<const u64*>(current.data_ptr<uint64_t>()),
+                rows,
+                len,
+                reinterpret_cast<const u64*>(chals_mont.data_ptr<uint64_t>()),
+                round,
+                reinterpret_cast<u64*>(next.data_ptr<uint64_t>()));
+            hp_spec::check_last_cuda("u64 terms update");
+
+            current = next;
+        }
+    }
+
+    auto output_normal = torch::empty_like(output_mont);
+
+    int conv_blocks_out = std::min(
+        SUMCHECK_MAX_BLOCKS,
+        static_cast<int>(
+            std::max<int64_t>(
+                1,
+                (output_mont.numel() + conv_threads - 1) / conv_threads
+            )
+        )
+    );
+
+    convert_from_mont_u64_kernel<<<conv_blocks_out, conv_threads, 0, stream>>>(
+        reinterpret_cast<const u64*>(output_mont.data_ptr<uint64_t>()),
+        static_cast<size_t>(output_mont.numel()),
+        reinterpret_cast<u64*>(output_normal.data_ptr<uint64_t>()));
+    hp_spec::check_last_cuda("u64 terms convert output");
+
+    auto claim0 = torch::empty({}, normal_tables.options());
+
+    claim0_from_output_u64_kernel<<<1, 1, 0, stream>>>(
+        reinterpret_cast<const u64*>(output_normal.data_ptr<uint64_t>()),
+        degree,
+        reinterpret_cast<u64*>(claim0.data_ptr<uint64_t>()));
+    hp_spec::check_last_cuda("u64 terms claim0");
+
+    return std::make_tuple(claim0, output_normal);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("sumcheck_terms_full_mont_u64_cuda",
+          &sumcheck_terms_full_mont_u64_cuda,
+          "Generic full Montgomery-domain u64 SumCheck");
+
     m.def("montgomery_u64_mul_test_cuda",
           &montgomery_u64_mul_test_cuda,
           "u64 Montgomery modular multiplication smoke test");

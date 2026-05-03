@@ -33,3 +33,20 @@ dist/
 .DS_Store
 .vscode/
 .idea/
+
+# local build artifacts
+
+# local patch/backup junk
+*.bak
+*.bak.*
+*.orig
+*.rej
+*~
+
+# notebooks/checkpoints
+notebooks/
+
+# benchmark output artifacts
+reports/raw/
+reports/plots/
+reports/*.csv

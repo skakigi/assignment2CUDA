@@ -1,0 +1,463 @@
+diff --git a/src/sumcheck_native.cu b/src/sumcheck_native.cu
+index f4d6a4a..39ab0dd 100644
+--- a/src/sumcheck_native.cu
++++ b/src/sumcheck_native.cu
+@@ -5503,6 +5503,306 @@ __device__ __forceinline__ u128x eval_hyperplonk_poly_at_x_mont_u128(
+     return {0ULL, 0ULL};
+ }
+ 
++
++
++// U128_FUSED_CACHED_PATCH_BEGIN
++// Cached + fused specialized u128 SumCheck path.
++// Main goals:
++//   1. avoid to_mont(x) inside the hot point loop
++//   2. load each row endpoint pair once per idx
++//   3. compute all x=0..degree values from cached zero/delta
++//   4. fuse MLE update into the eval pass
++constexpr int U128_SPEC_MAX_ROWS = 19;
++
++__device__ __forceinline__ u128x small_x_to_mont_u128(int x) {
++  // q = 2^128 - 159, so R mod q = 159.
++  // For x <= 7, xR mod q = 159*x and fits in one limb.
++  return {static_cast<u64>(x) * MONT_ONE_LO, 0ULL};
++}
++
++__device__ __forceinline__ u128x line_eval_delta_mont_u128(
++    u128x zero_eval,
++    u128x delta_eval,
++    u128x x_mont) {
++  return add_mod_u128(zero_eval, mont_mul(x_mont, delta_eval));
++}
++
++__device__ __forceinline__ u128x eval_hyperplonk_poly_cached_u128(
++    const u128x* __restrict__ z,
++    const u128x* __restrict__ delta,
++    int poly_id,
++    u128x x_mont) {
++#define U128_AT(row_) line_eval_delta_mont_u128(z[(row_)], delta[(row_)], x_mont)
++
++  u128x acc{0ULL, 0ULL};
++
++  if (poly_id == 8) {
++    return U128_AT(0);
++  }
++
++  if (poly_id == 9) {
++    u128x a = U128_AT(0);
++    u128x b = U128_AT(1);
++    return prod2_spec_u128(a, b);
++  }
++
++  if (poly_id == 10) {
++    u128x a = U128_AT(0);
++    u128x b = U128_AT(1);
++    u128x c = U128_AT(2);
++    return add_mod_u128(prod2_spec_u128(a, b), c);
++  }
++
++  if (poly_id == 11) {
++    u128x a = U128_AT(0);
++    u128x b = U128_AT(1);
++    u128x c = U128_AT(2);
++    return prod3_spec_u128(a, b, c);
++  }
++
++  if (poly_id == 12) {
++    u128x a = U128_AT(0);
++    u128x b = U128_AT(1);
++    u128x c = U128_AT(2);
++    return prod5_spec_u128(a, a, b, b, c);
++  }
++
++  if (poly_id == 13) {
++    u128x a = U128_AT(0);
++    u128x b = U128_AT(1);
++    u128x c = U128_AT(2);
++    u128x d = U128_AT(3);
++    u128x e = U128_AT(4);
++    return add_mod_u128(prod3_spec_u128(a, b, c), prod2_spec_u128(d, e));
++  }
++
++  if (poly_id == 14) {
++    u128x a = U128_AT(0);
++    u128x b = U128_AT(1);
++    u128x c = U128_AT(2);
++    u128x d = U128_AT(3);
++    u128x e = U128_AT(4);
++    u128x g = U128_AT(5);
++    return add_mod_u128(prod4_spec_u128(a, b, c, g), prod3_spec_u128(d, e, g));
++  }
++
++  if (poly_id == 0) {
++    u128x qL  = U128_AT(0);
++    u128x w1  = U128_AT(1);
++    u128x qR  = U128_AT(2);
++    u128x w2  = U128_AT(3);
++    u128x qM  = U128_AT(4);
++    u128x nqO = U128_AT(5);
++    u128x w3  = U128_AT(6);
++    u128x qC  = U128_AT(7);
++
++    acc = add_mod_u128(acc, prod2_spec_u128(qL, w1));
++    acc = add_mod_u128(acc, prod2_spec_u128(qR, w2));
++    acc = add_mod_u128(acc, prod3_spec_u128(qM, w1, w2));
++    acc = add_mod_u128(acc, prod2_spec_u128(nqO, w3));
++    acc = add_mod_u128(acc, qC);
++    return acc;
++  }
++
++  if (poly_id == 1) {
++    u128x qL  = U128_AT(0);
++    u128x w1  = U128_AT(1);
++    u128x qR  = U128_AT(2);
++    u128x w2  = U128_AT(3);
++    u128x qM  = U128_AT(4);
++    u128x nqO = U128_AT(5);
++    u128x w3  = U128_AT(6);
++    u128x qC  = U128_AT(7);
++    u128x fr  = U128_AT(8);
++
++    acc = add_mod_u128(acc, prod3_spec_u128(qL, w1, fr));
++    acc = add_mod_u128(acc, prod3_spec_u128(qR, w2, fr));
++    acc = add_mod_u128(acc, prod4_spec_u128(qM, w1, w2, fr));
++    acc = add_mod_u128(acc, prod3_spec_u128(nqO, w3, fr));
++    acc = add_mod_u128(acc, prod2_spec_u128(qC, fr));
++    return acc;
++  }
++
++  if (poly_id == 2) {
++    u128x pi   = U128_AT(0);
++    u128x np1  = U128_AT(1);
++    u128x p2   = U128_AT(2);
++    u128x aphi = U128_AT(3);
++    u128x D1   = U128_AT(4);
++    u128x D2   = U128_AT(5);
++    u128x D3   = U128_AT(6);
++    u128x nN1  = U128_AT(7);
++    u128x N2   = U128_AT(8);
++    u128x N3   = U128_AT(9);
++    u128x fr   = U128_AT(10);
++
++    acc = add_mod_u128(acc, prod2_spec_u128(pi, fr));
++    acc = add_mod_u128(acc, prod3_spec_u128(np1, p2, fr));
++    acc = add_mod_u128(acc, prod5_spec_u128(aphi, D1, D2, D3, fr));
++    acc = add_mod_u128(acc, prod4_spec_u128(nN1, N2, N3, fr));
++    return acc;
++  }
++
++  if (poly_id == 3) {
++#pragma unroll
++    for (int r = 0; r < 6; ++r) {
++      acc = add_mod_u128(acc, U128_AT(r));
++    }
++    return acc;
++  }
++
++  if (poly_id == 5 || poly_id == 6 || poly_id == 7) {
++    u128x q1 = U128_AT(0);
++    u128x w1 = U128_AT(1);
++    u128x q2 = U128_AT(2);
++    u128x w2 = U128_AT(3);
++    u128x qH = U128_AT(4);
++    u128x qC = U128_AT(5);
++
++    acc = add_mod_u128(acc, prod2_spec_u128(q1, w1));
++    acc = add_mod_u128(acc, prod2_spec_u128(q2, w2));
++
++    if (poly_id == 5) {
++      acc = add_mod_u128(acc, prod3_spec_u128(qH, w1, w2));
++    } else if (poly_id == 6) {
++      acc = add_mod_u128(acc, prod5_spec_u128(qH, w1, w1, w1, w2));
++    } else {
++      acc = add_mod_u128(acc, prod7_spec_u128(qH, w1, w1, w1, w1, w1, w2));
++    }
++
++    acc = add_mod_u128(acc, qC);
++    return acc;
++  }
++
++#undef U128_AT
++  return {0ULL, 0ULL};
++}
++
++__global__ void eval_hyperplonk_sumcheck_u128_fused_cached_kernel(
++    const u64* __restrict__ tables_lo,
++    const u64* __restrict__ tables_hi,
++    int len,
++    int rows,
++    int poly_id,
++    int degree,
++    const u64* __restrict__ chals_lo,
++    const u64* __restrict__ chals_hi,
++    int round,
++    u64* __restrict__ next_lo,
++    u64* __restrict__ next_hi,
++    u64* __restrict__ partials_lo,
++    u64* __restrict__ partials_hi) {
++  extern __shared__ u64 shared[];
++
++  const int tid = threadIdx.x;
++  const int lane = tid & 31;
++  const int warp_id = tid >> 5;
++  const int num_warps = (blockDim.x + 31) >> 5;
++  const int half = len >> 1;
++  const bool do_update = (next_lo != nullptr) && (next_hi != nullptr);
++
++  u128x challenge{0ULL, 0ULL};
++  if (do_update) {
++    challenge = {chals_lo[round], chals_hi[round]};
++  }
++
++  u128x local[8];
++#pragma unroll
++  for (int x = 0; x < 8; ++x) {
++    local[x] = {0ULL, 0ULL};
++  }
++
++  for (int i = blockIdx.x * blockDim.x + tid;
++       i < half;
++       i += blockDim.x * gridDim.x) {
++    u128x z[U128_SPEC_MAX_ROWS];
++    u128x delta[U128_SPEC_MAX_ROWS];
++
++#pragma unroll
++    for (int row = 0; row < U128_SPEC_MAX_ROWS; ++row) {
++      if (row < rows) {
++        const size_t base =
++            static_cast<size_t>(row) * static_cast<size_t>(len);
++        u128x zero_eval{tables_lo[base + i], tables_hi[base + i]};
++        u128x one_eval{
++            tables_lo[base + i + half],
++            tables_hi[base + i + half]};
++        z[row] = zero_eval;
++        delta[row] = sub_mod_u128(one_eval, zero_eval);
++      } else {
++        z[row] = {0ULL, 0ULL};
++        delta[row] = {0ULL, 0ULL};
++      }
++    }
++
++#pragma unroll
++    for (int x = 0; x < 8; ++x) {
++      if (x <= degree) {
++        const u128x x_mont = small_x_to_mont_u128(x);
++        u128x y = eval_hyperplonk_poly_cached_u128(
++            z, delta, poly_id, x_mont);
++        local[x] = add_mod_u128(local[x], y);
++      }
++    }
++
++    if (do_update) {
++#pragma unroll
++      for (int row = 0; row < U128_SPEC_MAX_ROWS; ++row) {
++        if (row < rows) {
++          const size_t out_base =
++              static_cast<size_t>(row) * static_cast<size_t>(half);
++          u128x folded = line_eval_delta_mont_u128(
++              z[row], delta[row], challenge);
++          next_lo[out_base + i] = folded.lo;
++          next_hi[out_base + i] = folded.hi;
++        }
++      }
++    }
++  }
++
++#pragma unroll
++  for (int x = 0; x < 8; ++x) {
++    if (x <= degree) {
++      u128x reduced = warp_reduce_add_mod_u128(local[x]);
++      if (lane == 0) {
++        int slot = (x * num_warps + warp_id) * 2;
++        shared[slot + 0] = reduced.lo;
++        shared[slot + 1] = reduced.hi;
++      }
++    }
++  }
++
++  __syncthreads();
++
++  if (warp_id == 0) {
++#pragma unroll
++    for (int x = 0; x < 8; ++x) {
++      if (x <= degree) {
++        u128x value{0ULL, 0ULL};
++
++        if (lane < num_warps) {
++          int slot = (x * num_warps + lane) * 2;
++          value.lo = shared[slot + 0];
++          value.hi = shared[slot + 1];
++        }
++
++        value = warp_reduce_add_mod_u128(value);
++
++        if (lane == 0) {
++          const size_t out_idx =
++              static_cast<size_t>(blockIdx.x) *
++                  static_cast<size_t>(degree + 1) +
++              static_cast<size_t>(x);
++          partials_lo[out_idx] = value.lo;
++          partials_hi[out_idx] = value.hi;
++        }
++      }
++    }
++  }
++}
++// U128_FUSED_CACHED_PATCH_END
++
++
+ __global__ void eval_hyperplonk_sumcheck_u128_kernel(
+     const u64* __restrict__ tables_lo,
+     const u64* __restrict__ tables_hi,
+@@ -5701,74 +6001,76 @@ std::tuple<torch::Tensor, torch::Tensor> sumcheck_hyperplonk_full_mont_u128_cuda
+         torch::empty({rounds, degree + 1}, normal_hi.options());
+ 
+     for (int round = 0; round < rounds; ++round) {
+-        int len = static_cast<int>(current_lo.size(1));
+-        int half = len >> 1;
+-
+-        int blocks = std::min(
+-            SUMCHECK_MAX_BLOCKS,
+-            std::max(1, (half + SUMCHECK_THREADS - 1) / SUMCHECK_THREADS)
+-        );
++    int len = static_cast<int>(current_lo.size(1));
++    int half = len >> 1;
+ 
+-        auto partials_lo =
+-            torch::empty({blocks, degree + 1}, normal_lo.options());
+-        auto partials_hi =
+-            torch::empty({blocks, degree + 1}, normal_hi.options());
++    int blocks = std::min(
++        SUMCHECK_MAX_BLOCKS,
++        std::max(1, (half + SUMCHECK_THREADS - 1) / SUMCHECK_THREADS));
+ 
+-        size_t shmem =
+-            static_cast<size_t>(degree + 1) *
+-            SUMCHECK_THREADS *
+-            2 *
+-            sizeof(u64);
++    auto partials_lo = torch::empty({blocks, degree + 1}, normal_lo.options());
++    auto partials_hi = torch::empty({blocks, degree + 1}, normal_hi.options());
+ 
+-        eval_hyperplonk_sumcheck_u128_kernel<<<blocks, SUMCHECK_THREADS, shmem, stream>>>(
+-            reinterpret_cast<const u64*>(current_lo.data_ptr<uint64_t>()),
+-            reinterpret_cast<const u64*>(current_hi.data_ptr<uint64_t>()),
+-            len,
+-            poly_id,
+-            degree,
+-            reinterpret_cast<u64*>(partials_lo.data_ptr<uint64_t>()),
+-            reinterpret_cast<u64*>(partials_hi.data_ptr<uint64_t>()));
+-        hp_spec::check_last_cuda("u128 spec eval");
++    torch::Tensor next_lo;
++    torch::Tensor next_hi;
++    u64* next_lo_ptr = nullptr;
++    u64* next_hi_ptr = nullptr;
+ 
+-        reduce_sumcheck_u128_kernel<<<degree + 1, SUMCHECK_THREADS, 0, stream>>>(
+-            reinterpret_cast<const u64*>(partials_lo.data_ptr<uint64_t>()),
+-            reinterpret_cast<const u64*>(partials_hi.data_ptr<uint64_t>()),
+-            blocks,
+-            degree,
+-            reinterpret_cast<u64*>(output_mont_lo[round].data_ptr<uint64_t>()),
+-            reinterpret_cast<u64*>(output_mont_hi[round].data_ptr<uint64_t>()));
+-        hp_spec::check_last_cuda("u128 spec reduce");
++    if (round + 1 < rounds) {
++      next_lo = torch::empty({rows, half}, normal_lo.options());
++      next_hi = torch::empty({rows, half}, normal_hi.options());
++      next_lo_ptr = reinterpret_cast<u64*>(next_lo.data_ptr());
++      next_hi_ptr = reinterpret_cast<u64*>(next_hi.data_ptr());
++    }
+ 
+-        if (round + 1 < rounds) {
+-            auto next_lo = torch::empty({rows, half}, normal_lo.options());
+-            auto next_hi = torch::empty({rows, half}, normal_hi.options());
++    size_t shmem =
++        static_cast<size_t>(degree + 1) *
++        static_cast<size_t>(SUMCHECK_THREADS) *
++        2 *
++        sizeof(u64);
+ 
+-            int upd_blocks = std::min(
+-                SUMCHECK_MAX_BLOCKS,
+-                std::max(
+-                    1,
+-                    (rows * half + SUMCHECK_THREADS - 1) / SUMCHECK_THREADS
+-                )
+-            );
++    eval_hyperplonk_sumcheck_u128_fused_cached_kernel<<<
++        blocks,
++        SUMCHECK_THREADS,
++        shmem,
++        stream>>>(
++        reinterpret_cast<const u64*>(current_lo.data_ptr()),
++        reinterpret_cast<const u64*>(current_hi.data_ptr()),
++        len,
++        rows,
++        poly_id,
++        degree,
++        reinterpret_cast<const u64*>(ch_mont_lo.data_ptr()),
++        reinterpret_cast<const u64*>(ch_mont_hi.data_ptr()),
++        round,
++        next_lo_ptr,
++        next_hi_ptr,
++        reinterpret_cast<u64*>(partials_lo.data_ptr()),
++        reinterpret_cast<u64*>(partials_hi.data_ptr()));
++
++    hp_spec::check_last_cuda("u128 spec fused cached eval/update");
++
++    reduce_sumcheck_u128_kernel<<<
++        degree + 1,
++        SUMCHECK_THREADS,
++        0,
++        stream>>>(
++        reinterpret_cast<const u64*>(partials_lo.data_ptr()),
++        reinterpret_cast<const u64*>(partials_hi.data_ptr()),
++        blocks,
++        degree,
++        reinterpret_cast<u64*>(output_mont_lo[round].data_ptr()),
++        reinterpret_cast<u64*>(output_mont_hi[round].data_ptr()));
+ 
+-            update_sumcheck_u128_kernel<<<upd_blocks, SUMCHECK_THREADS, 0, stream>>>(
+-                reinterpret_cast<const u64*>(current_lo.data_ptr<uint64_t>()),
+-                reinterpret_cast<const u64*>(current_hi.data_ptr<uint64_t>()),
+-                rows,
+-                len,
+-                reinterpret_cast<const u64*>(ch_mont_lo.data_ptr<uint64_t>()),
+-                reinterpret_cast<const u64*>(ch_mont_hi.data_ptr<uint64_t>()),
+-                round,
+-                reinterpret_cast<u64*>(next_lo.data_ptr<uint64_t>()),
+-                reinterpret_cast<u64*>(next_hi.data_ptr<uint64_t>()));
+-            hp_spec::check_last_cuda("u128 spec update");
++    hp_spec::check_last_cuda("u128 spec reduce");
+ 
+-            current_lo = next_lo;
+-            current_hi = next_hi;
+-        }
++    if (round + 1 < rounds) {
++      current_lo = next_lo;
++      current_hi = next_hi;
+     }
++  }
+ 
+-    auto output_lo = torch::empty_like(output_mont_lo);
++  auto output_lo = torch::empty_like(output_mont_lo);
+     auto output_hi = torch::empty_like(output_mont_hi);
+ 
+     int conv_blocks_out = std::min(
+diff --git a/student.py b/student.py
+index d9f7276..b020e2c 100644
+--- a/student.py
++++ b/student.py
+@@ -99,6 +99,12 @@ def _native_sumcheck(eval_tables, challenges, modulus: int):
+     tables = _torch_to_uint64_cuda(eval_tables, eval_tables.device)
+     rs = challenges if isinstance(challenges, torch.Tensor) else torch.as_tensor(challenges)
+     rs = _torch_to_uint64_cuda(rs, eval_tables.device)
++    # Some benchmark-focused builds export only the explicit u32/u64/u128
++    # entry points, not the legacy simple `sumcheck_cuda` API.
++    # Keep this consistent with the other native paths: use native only
++    # when the expected symbol exists, otherwise fall back to reference.
++    if not hasattr(native, "sumcheck_cuda"):
++        return None
+     return native.sumcheck_cuda(tables, rs, int(modulus))
+ 
+ 

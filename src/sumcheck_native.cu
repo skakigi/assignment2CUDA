@@ -1435,7 +1435,551 @@ extern "C" const char* sc_last_error_message(void) {
 }
 
 
+
+
+// ============================================================================
+// Specialized HyperPlonk-style u32 SumCheck fast paths.
+// These are fixed-template kernels used to compare against the generic
+// term_offsets / term_vars backend.
+// ============================================================================
+
+namespace hp_spec {
+
+using u32 = uint32_t;
+using u64 = uint64_t;
+
+constexpr int THREADS = 128;
+constexpr int MAX_BLOCKS = 4096;
+constexpr u32 Q32_FAST = 4294967291u; // 2^32 - 5
+
+__device__ __forceinline__ u32 add_mod(u32 a, u32 b, u32 q) {
+    u64 s = static_cast<u64>(a) + static_cast<u64>(b);
+    if (s >= q) s -= q;
+    if (s >= q) s %= q;
+    return static_cast<u32>(s);
+}
+
+__device__ __forceinline__ u32 sub_mod(u32 a, u32 b, u32 q) {
+    return (a >= b) ? static_cast<u32>(a - b) : static_cast<u32>(static_cast<u64>(a) + q - b);
+}
+
+__device__ __forceinline__ u32 reduce_q32_fast(u64 z) {
+    // For q = 2^32 - 5, use 2^32 == 5 mod q.
+    u64 r = (z & 0xffffffffULL) + 5ULL * (z >> 32);
+    r = (r & 0xffffffffULL) + 5ULL * (r >> 32);
+    r = (r & 0xffffffffULL) + 5ULL * (r >> 32);
+
+    while (r >= Q32_FAST) r -= Q32_FAST;
+    return static_cast<u32>(r);
+}
+
+__device__ __forceinline__ u32 mul_mod(u32 a, u32 b, u32 q) {
+    u64 z = static_cast<u64>(a) * static_cast<u64>(b);
+    if (q == Q32_FAST) {
+        return reduce_q32_fast(z);
+    }
+    return static_cast<u32>(z % static_cast<u64>(q));
+}
+
+__device__ __forceinline__ u32 line_eval(u32 z, u32 o, u32 t, u32 q) {
+    u32 delta = sub_mod(o, z, q);
+    return add_mod(z, mul_mod(delta, t, q), q);
+}
+
+__device__ __forceinline__ u32 load_line(
+    const u32* __restrict__ tables,
+    int len,
+    int row,
+    int idx,
+    int half,
+    u32 x,
+    u32 q) {
+    const u32* r = tables + static_cast<size_t>(row) * static_cast<size_t>(len);
+    return line_eval(r[idx], r[idx + half], x, q);
+}
+
+__device__ __forceinline__ u32 prod2(u32 a, u32 b, u32 q) {
+    return mul_mod(a, b, q);
+}
+
+__device__ __forceinline__ u32 prod3(u32 a, u32 b, u32 c, u32 q) {
+    return mul_mod(mul_mod(a, b, q), c, q);
+}
+
+__device__ __forceinline__ u32 prod4(u32 a, u32 b, u32 c, u32 d, u32 q) {
+    return mul_mod(mul_mod(mul_mod(a, b, q), c, q), d, q);
+}
+
+__device__ __forceinline__ u32 prod5(u32 a, u32 b, u32 c, u32 d, u32 e, u32 q) {
+    return mul_mod(mul_mod(mul_mod(mul_mod(a, b, q), c, q), d, q), e, q);
+}
+
+__device__ __forceinline__ u32 prod6(u32 a, u32 b, u32 c, u32 d, u32 e, u32 f, u32 q) {
+    return mul_mod(prod5(a, b, c, d, e, q), f, q);
+}
+
+__device__ __forceinline__ u32 prod7(u32 a, u32 b, u32 c, u32 d, u32 e, u32 f, u32 g, u32 q) {
+    return mul_mod(prod6(a, b, c, d, e, f, q), g, q);
+}
+
+__device__ __forceinline__ u32 eval_poly_at_x(
+    const u32* __restrict__ tables,
+    int len,
+    int idx,
+    int half,
+    int poly_id,
+    u32 x,
+    u32 q) {
+
+    u32 acc = 0;
+
+    if (poly_id == 0) {
+        // vanilla_gate:
+        // qL*w1 + qR*w2 + qM*w1*w2 + neg_qO*w3 + qC
+        u32 qL = load_line(tables, len, 0, idx, half, x, q);
+        u32 w1 = load_line(tables, len, 1, idx, half, x, q);
+        u32 qR = load_line(tables, len, 2, idx, half, x, q);
+        u32 w2 = load_line(tables, len, 3, idx, half, x, q);
+        u32 qM = load_line(tables, len, 4, idx, half, x, q);
+        u32 nqO = load_line(tables, len, 5, idx, half, x, q);
+        u32 w3 = load_line(tables, len, 6, idx, half, x, q);
+        u32 qC = load_line(tables, len, 7, idx, half, x, q);
+
+        acc = add_mod(acc, prod2(qL, w1, q), q);
+        acc = add_mod(acc, prod2(qR, w2, q), q);
+        acc = add_mod(acc, prod3(qM, w1, w2, q), q);
+        acc = add_mod(acc, prod2(nqO, w3, q), q);
+        acc = add_mod(acc, qC, q);
+        return acc;
+    }
+
+    if (poly_id == 1) {
+        // vanilla_zero = vanilla_gate * fr, termwise.
+        u32 qL = load_line(tables, len, 0, idx, half, x, q);
+        u32 w1 = load_line(tables, len, 1, idx, half, x, q);
+        u32 qR = load_line(tables, len, 2, idx, half, x, q);
+        u32 w2 = load_line(tables, len, 3, idx, half, x, q);
+        u32 qM = load_line(tables, len, 4, idx, half, x, q);
+        u32 nqO = load_line(tables, len, 5, idx, half, x, q);
+        u32 w3 = load_line(tables, len, 6, idx, half, x, q);
+        u32 qC = load_line(tables, len, 7, idx, half, x, q);
+        u32 fr = load_line(tables, len, 8, idx, half, x, q);
+
+        acc = add_mod(acc, prod3(qL, w1, fr, q), q);
+        acc = add_mod(acc, prod3(qR, w2, fr, q), q);
+        acc = add_mod(acc, prod4(qM, w1, w2, fr, q), q);
+        acc = add_mod(acc, prod3(nqO, w3, fr, q), q);
+        acc = add_mod(acc, prod2(qC, fr, q), q);
+        return acc;
+    }
+
+    if (poly_id == 2) {
+        // vanilla_perm:
+        // (pi - p1*p2 + alpha*phi*D1*D2*D3 - alpha*N1*N2*N3) * fr
+        // Signs/scalars are folded into rows.
+        u32 pi = load_line(tables, len, 0, idx, half, x, q);
+        u32 np1 = load_line(tables, len, 1, idx, half, x, q);
+        u32 p2 = load_line(tables, len, 2, idx, half, x, q);
+        u32 aphi = load_line(tables, len, 3, idx, half, x, q);
+        u32 D1 = load_line(tables, len, 4, idx, half, x, q);
+        u32 D2 = load_line(tables, len, 5, idx, half, x, q);
+        u32 D3 = load_line(tables, len, 6, idx, half, x, q);
+        u32 nalphaN1 = load_line(tables, len, 7, idx, half, x, q);
+        u32 N2 = load_line(tables, len, 8, idx, half, x, q);
+        u32 N3 = load_line(tables, len, 9, idx, half, x, q);
+        u32 fr = load_line(tables, len, 10, idx, half, x, q);
+
+        acc = add_mod(acc, prod2(pi, fr, q), q);
+        acc = add_mod(acc, prod3(np1, p2, fr, q), q);
+        acc = add_mod(acc, prod5(aphi, D1, D2, D3, fr, q), q);
+        acc = add_mod(acc, prod4(nalphaN1, N2, N3, fr, q), q);
+        return acc;
+    }
+
+    if (poly_id == 3) {
+        // opencheck_6: y1*k1 + ... + y6*k6, coefficients folded into rows.
+        #pragma unroll
+        for (int r = 0; r < 6; ++r) {
+            acc = add_mod(acc, load_line(tables, len, r, idx, half, x, q), q);
+        }
+        return acc;
+    }
+
+    if (poly_id == 4) {
+        // jellyfish_zero structural template.
+        u32 q1 = load_line(tables, len, 0, idx, half, x, q);
+        u32 w1 = load_line(tables, len, 1, idx, half, x, q);
+        u32 q2 = load_line(tables, len, 2, idx, half, x, q);
+        u32 w2 = load_line(tables, len, 3, idx, half, x, q);
+        u32 q3 = load_line(tables, len, 4, idx, half, x, q);
+        u32 w3 = load_line(tables, len, 5, idx, half, x, q);
+        u32 q4 = load_line(tables, len, 6, idx, half, x, q);
+        u32 w4 = load_line(tables, len, 7, idx, half, x, q);
+        u32 qM1 = load_line(tables, len, 8, idx, half, x, q);
+        u32 qM2 = load_line(tables, len, 9, idx, half, x, q);
+        u32 qH1 = load_line(tables, len, 10, idx, half, x, q);
+        u32 qH2 = load_line(tables, len, 11, idx, half, x, q);
+        u32 qH3 = load_line(tables, len, 12, idx, half, x, q);
+        u32 qH4 = load_line(tables, len, 13, idx, half, x, q);
+        u32 nqO = load_line(tables, len, 14, idx, half, x, q);
+        u32 w5 = load_line(tables, len, 15, idx, half, x, q);
+        u32 qECC = load_line(tables, len, 16, idx, half, x, q);
+        u32 fr = load_line(tables, len, 17, idx, half, x, q);
+        u32 qC = load_line(tables, len, 18, idx, half, x, q);
+
+        acc = add_mod(acc, prod3(q1, w1, fr, q), q);
+        acc = add_mod(acc, prod3(q2, w2, fr, q), q);
+        acc = add_mod(acc, prod3(q3, w3, fr, q), q);
+        acc = add_mod(acc, prod3(q4, w4, fr, q), q);
+        acc = add_mod(acc, prod4(qM1, w1, w2, fr, q), q);
+        acc = add_mod(acc, prod4(qM2, w3, w4, fr, q), q);
+
+        u32 w1_5 = prod5(w1, w1, w1, w1, w1, q);
+        u32 w2_5 = prod5(w2, w2, w2, w2, w2, q);
+        u32 w3_5 = prod5(w3, w3, w3, w3, w3, q);
+        u32 w4_5 = prod5(w4, w4, w4, w4, w4, q);
+
+        acc = add_mod(acc, prod3(qH1, w1_5, fr, q), q);
+        acc = add_mod(acc, prod3(qH2, w2_5, fr, q), q);
+        acc = add_mod(acc, prod3(qH3, w3_5, fr, q), q);
+        acc = add_mod(acc, prod3(qH4, w4_5, fr, q), q);
+        acc = add_mod(acc, prod3(nqO, w5, fr, q), q);
+        acc = add_mod(acc, prod6(qECC, w1, w2, w3, w4, fr, q), q);
+        acc = add_mod(acc, prod2(qC, fr, q), q);
+
+        return acc;
+    }
+
+    if (poly_id == 8) {
+        // baseline_linear: a
+        u32 a = load_line(tables, len, 0, idx, half, x, q);
+        return a;
+    }
+
+    if (poly_id == 9) {
+        // baseline_mul: a*b
+        u32 a = load_line(tables, len, 0, idx, half, x, q);
+        u32 b = load_line(tables, len, 1, idx, half, x, q);
+        return prod2(a, b, q);
+    }
+
+    if (poly_id == 10) {
+        // baseline_mul_add: a*b + c
+        u32 a = load_line(tables, len, 0, idx, half, x, q);
+        u32 b = load_line(tables, len, 1, idx, half, x, q);
+        u32 c = load_line(tables, len, 2, idx, half, x, q);
+        return add_mod(prod2(a, b, q), c, q);
+    }
+
+    if (poly_id == 11) {
+        // baseline_cubic_product: a*b*c
+        u32 a = load_line(tables, len, 0, idx, half, x, q);
+        u32 b = load_line(tables, len, 1, idx, half, x, q);
+        u32 c = load_line(tables, len, 2, idx, half, x, q);
+        return prod3(a, b, c, q);
+    }
+
+    if (poly_id == 5 || poly_id == 6 || poly_id == 7) {
+        // custom gate family:
+        //   q1*w1 + q2*w2 + qH*w1^k*w2 + qC
+        //
+        // poly_id 5: degree 3 term qH*w1*w2
+        // poly_id 6: degree 5 term qH*w1^3*w2
+        // poly_id 7: degree 7 term qH*w1^5*w2
+        u32 q1 = load_line(tables, len, 0, idx, half, x, q);
+        u32 w1 = load_line(tables, len, 1, idx, half, x, q);
+        u32 q2 = load_line(tables, len, 2, idx, half, x, q);
+        u32 w2 = load_line(tables, len, 3, idx, half, x, q);
+        u32 qH = load_line(tables, len, 4, idx, half, x, q);
+        u32 qC = load_line(tables, len, 5, idx, half, x, q);
+
+        acc = add_mod(acc, prod2(q1, w1, q), q);
+        acc = add_mod(acc, prod2(q2, w2, q), q);
+
+        if (poly_id == 5) {
+            acc = add_mod(acc, prod3(qH, w1, w2, q), q);
+        } else if (poly_id == 6) {
+            acc = add_mod(acc, prod5(qH, w1, w1, w1, w2, q), q);
+        } else {
+            acc = add_mod(acc, prod7(qH, w1, w1, w1, w1, w1, w2, q), q);
+        }
+
+        acc = add_mod(acc, qC, q);
+        return acc;
+    }
+
+    return 0;
+}
+
+__global__ void eval_kernel(
+    const u32* __restrict__ tables,
+    int len,
+    int poly_id,
+    int degree,
+    u32 q,
+    u32* __restrict__ partials) {
+
+    extern __shared__ u32 shared[];
+    int tid = threadIdx.x;
+    int half = len >> 1;
+
+    u32 local[8];
+    #pragma unroll
+    for (int x = 0; x < 8; ++x) {
+        local[x] = 0;
+    }
+
+    for (int i = blockIdx.x * blockDim.x + tid;
+         i < half;
+         i += blockDim.x * gridDim.x) {
+        for (int x = 0; x <= degree; ++x) {
+            u32 y = eval_poly_at_x(tables, len, i, half, poly_id, static_cast<u32>(x), q);
+            local[x] = add_mod(local[x], y, q);
+        }
+    }
+
+    for (int x = 0; x <= degree; ++x) {
+        shared[x * blockDim.x + tid] = local[x];
+    }
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            for (int x = 0; x <= degree; ++x) {
+                u32* row = shared + x * blockDim.x;
+                row[tid] = add_mod(row[tid], row[tid + stride], q);
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        for (int x = 0; x <= degree; ++x) {
+            partials[static_cast<size_t>(blockIdx.x) * static_cast<size_t>(degree + 1) + x] =
+                shared[x * blockDim.x];
+        }
+    }
+}
+
+__global__ void reduce_kernel(
+    const u32* __restrict__ partials,
+    int num_blocks,
+    int degree,
+    u32 q,
+    u32* __restrict__ out_round) {
+
+    __shared__ u32 scratch[THREADS];
+    int x = blockIdx.x;
+    int tid = threadIdx.x;
+
+    u32 acc = 0;
+    for (int b = tid; b < num_blocks; b += blockDim.x) {
+        acc = add_mod(acc, partials[static_cast<size_t>(b) * static_cast<size_t>(degree + 1) + x], q);
+    }
+
+    scratch[tid] = acc;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            scratch[tid] = add_mod(scratch[tid], scratch[tid + stride], q);
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        out_round[x] = scratch[0];
+    }
+}
+
+__global__ void update_kernel(
+    const u32* __restrict__ in_tables,
+    int rows,
+    int len,
+    const u32* __restrict__ challenges,
+    int round,
+    u32 q,
+    u32* __restrict__ out_tables) {
+
+    int half = len >> 1;
+    size_t total = static_cast<size_t>(rows) * static_cast<size_t>(half);
+
+    for (size_t linear = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         linear < total;
+         linear += static_cast<size_t>(gridDim.x) * blockDim.x) {
+
+        int row = static_cast<int>(linear / half);
+        int i = static_cast<int>(linear - static_cast<size_t>(row) * static_cast<size_t>(half));
+
+        const u32* in_row = in_tables + static_cast<size_t>(row) * static_cast<size_t>(len);
+        u32* out_row = out_tables + static_cast<size_t>(row) * static_cast<size_t>(half);
+
+        u32 r = challenges[round];
+        out_row[i] = line_eval(in_row[i], in_row[i + half], r, q);
+    }
+}
+
+int degree_for_poly(int poly_id) {
+    switch (poly_id) {
+        case 0: return 3; // vanilla_gate
+        case 1: return 4; // vanilla_zero
+        case 2: return 5; // vanilla_perm
+        case 3: return 1; // opencheck_6
+        case 4: return 7; // jellyfish_zero
+        case 5: return 3; // custom_gate_deg3
+        case 6: return 5; // custom_gate_deg5
+        case 7: return 7; // custom_gate_deg7
+        case 8: return 1; // baseline_linear: a
+        case 9: return 2; // baseline_mul: a*b
+        case 10: return 2; // baseline_mul_add: a*b+c
+        case 11: return 3; // baseline_cubic_product: a*b*c
+        default: throw std::invalid_argument("unknown HyperPlonk poly_id");
+    }
+}
+
+int rows_for_poly(int poly_id) {
+    switch (poly_id) {
+        case 0: return 8;
+        case 1: return 9;
+        case 2: return 11;
+        case 3: return 6;
+        case 4: return 19;
+        case 5: return 6;
+        case 6: return 6;
+        case 7: return 6;
+        case 8: return 1;
+        case 9: return 2;
+        case 10: return 3;
+        case 11: return 3;
+        default: throw std::invalid_argument("unknown HyperPlonk poly_id");
+    }
+}
+
+bool is_power_of_two_i64(int64_t x) {
+    return x > 0 && ((x & (x - 1)) == 0);
+}
+
+int log2_exact_i64(int64_t x) {
+    int r = 0;
+    while (x > 1) {
+        x >>= 1;
+        ++r;
+    }
+    return r;
+}
+
+void check_last_cuda(const char* label) {
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error(std::string(label) + ": " + cudaGetErrorString(err));
+    }
+}
+
+} // namespace hp_spec
+
+torch::Tensor sumcheck_hyperplonk_u32_cuda(
+    torch::Tensor eval_tables,
+    torch::Tensor challenges,
+    uint64_t modulus,
+    int64_t poly_id_64) {
+
+    using namespace hp_spec;
+
+    int poly_id = static_cast<int>(poly_id_64);
+    int degree = degree_for_poly(poly_id);
+    int rows = rows_for_poly(poly_id);
+
+    if (!eval_tables.is_cuda()) {
+        throw std::invalid_argument("eval_tables must be CUDA");
+    }
+    if (eval_tables.scalar_type() != torch::kUInt32) {
+        throw std::invalid_argument("eval_tables must be torch.uint32");
+    }
+    if (eval_tables.dim() != 2) {
+        throw std::invalid_argument("eval_tables must have shape (rows, N)");
+    }
+    if (eval_tables.size(0) < rows) {
+        throw std::invalid_argument("eval_tables has too few rows for requested poly_id");
+    }
+    if (!is_power_of_two_i64(eval_tables.size(1))) {
+        throw std::invalid_argument("N must be a power of two");
+    }
+    if (modulus > 0xffffffffULL) {
+        throw std::invalid_argument("sumcheck_hyperplonk_u32_cuda requires a u32 modulus");
+    }
+
+    const c10::cuda::CUDAGuard device_guard(eval_tables.device());
+
+    auto tables = eval_tables.narrow(0, 0, rows).contiguous();
+    auto rs = challenges.to(eval_tables.options().dtype(torch::kUInt32)).contiguous();
+
+    int initial_len = static_cast<int>(tables.size(1));
+    int rounds = log2_exact_i64(initial_len);
+
+    if (rs.dim() != 1 || rs.size(0) < rounds) {
+        throw std::invalid_argument("challenges must have shape at least (log2(N),)");
+    }
+
+    auto output = torch::empty({rounds, degree + 1}, tables.options());
+    auto current = tables;
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    u32 q = static_cast<u32>(modulus);
+
+    for (int round = 0; round < rounds; ++round) {
+        int len = static_cast<int>(current.size(1));
+        int half = len >> 1;
+        int blocks = std::min(MAX_BLOCKS, std::max(1, (half + THREADS - 1) / THREADS));
+
+        auto partials = torch::empty({blocks, degree + 1}, tables.options());
+        size_t shmem = static_cast<size_t>(degree + 1) * THREADS * sizeof(u32);
+
+        eval_kernel<<<blocks, THREADS, shmem, stream>>>(
+            reinterpret_cast<const u32*>(current.data_ptr<uint32_t>()),
+            len,
+            poly_id,
+            degree,
+            q,
+            reinterpret_cast<u32*>(partials.data_ptr<uint32_t>()));
+        check_last_cuda("hp_spec eval_kernel");
+
+        reduce_kernel<<<degree + 1, THREADS, 0, stream>>>(
+            reinterpret_cast<const u32*>(partials.data_ptr<uint32_t>()),
+            blocks,
+            degree,
+            q,
+            reinterpret_cast<u32*>(output[round].data_ptr<uint32_t>()));
+        check_last_cuda("hp_spec reduce_kernel");
+
+        if (round + 1 < rounds) {
+            auto next = torch::empty({rows, half}, tables.options());
+            int upd_blocks = std::min(
+                MAX_BLOCKS,
+                std::max(1, (rows * half + THREADS - 1) / THREADS));
+
+            update_kernel<<<upd_blocks, THREADS, 0, stream>>>(
+                reinterpret_cast<const u32*>(current.data_ptr<uint32_t>()),
+                rows,
+                len,
+                reinterpret_cast<const u32*>(rs.data_ptr<uint32_t>()),
+                round,
+                q,
+                reinterpret_cast<u32*>(next.data_ptr<uint32_t>()));
+            check_last_cuda("hp_spec update_kernel");
+
+            current = next;
+        }
+    }
+
+    return output;
+}
+
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("sumcheck_terms_u32_cuda", &torch_sumcheck_terms_u32_cuda,
           "Uploaded-base u32 SumCheck over arbitrary product-term expressions");
+    m.def("sumcheck_hyperplonk_u32_cuda",
+          &sumcheck_hyperplonk_u32_cuda,
+          "Specialized u32 SumCheck for fixed HyperPlonk-style polynomial templates");
+
 }

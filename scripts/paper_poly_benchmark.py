@@ -174,7 +174,13 @@ def main():
     args = parser.parse_args()
 
     num_vars_list = [int(x) for x in args.num_vars.split(",")]
-    poly_names = [x.strip() for x in args.polys.split(",") if x.strip()]
+    if args.polys.strip().lower() == "all":
+        if "DEFAULT_ORDER" in globals():
+            poly_names = list(DEFAULT_ORDER)
+        else:
+            poly_names = list(POLYS.keys())
+    else:
+        poly_names = [x.strip() for x in args.polys.split(",") if x.strip()]
 
     print("device:", torch.cuda.get_device_name())
     print("SC_EVAL_VARIANT:", os.environ.get("SC_EVAL_VARIANT", "unset/default"))

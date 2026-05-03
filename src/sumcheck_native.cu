@@ -1740,6 +1740,36 @@ __device__ __forceinline__ u32 eval_poly_at_x(
         return prod3(a, b, c, q);
     }
 
+
+    if (poly_id == 12) {
+        // advanced_a2b2c old hp_spec: a*a*b*b*c
+        u32 a = load_line(tables, len, 0, idx, half, x, q);
+        u32 b = load_line(tables, len, 1, idx, half, x, q);
+        u32 c = load_line(tables, len, 2, idx, half, x, q);
+        return prod5(a, a, b, b, c, q);
+    }
+
+    if (poly_id == 13) {
+        // advanced_abc_plus_de old hp_spec: a*b*c + d*e
+        u32 a = load_line(tables, len, 0, idx, half, x, q);
+        u32 b = load_line(tables, len, 1, idx, half, x, q);
+        u32 c = load_line(tables, len, 2, idx, half, x, q);
+        u32 d = load_line(tables, len, 3, idx, half, x, q);
+        u32 e = load_line(tables, len, 4, idx, half, x, q);
+        return add_mod(prod3(a, b, c, q), prod2(d, e, q), q);
+    }
+
+    if (poly_id == 14) {
+        // advanced_abcg_plus_deg old hp_spec: a*b*c*g + d*e*g
+        u32 a = load_line(tables, len, 0, idx, half, x, q);
+        u32 b = load_line(tables, len, 1, idx, half, x, q);
+        u32 c = load_line(tables, len, 2, idx, half, x, q);
+        u32 d = load_line(tables, len, 3, idx, half, x, q);
+        u32 e = load_line(tables, len, 4, idx, half, x, q);
+        u32 g = load_line(tables, len, 5, idx, half, x, q);
+        return add_mod(prod4(a, b, c, g, q), prod3(d, e, g, q), q);
+    }
+
     if (poly_id == 5 || poly_id == 6 || poly_id == 7) {
         // custom gate family:
         //   q1*w1 + q2*w2 + qH*w1^k*w2 + qC
@@ -1932,6 +1962,9 @@ int degree_for_poly(int poly_id) {
         case 9: return 2; // baseline_mul: a*b
         case 10: return 2; // baseline_mul_add: a*b+c
         case 11: return 3; // baseline_cubic_product: a*b*c
+        case 12: return 5; // advanced_a2b2c
+        case 13: return 3; // advanced_abc_plus_de
+        case 14: return 4; // advanced_abcg_plus_deg
         default: throw std::invalid_argument("unknown HyperPlonk poly_id");
     }
 }
@@ -1950,6 +1983,9 @@ int rows_for_poly(int poly_id) {
         case 9: return 2;
         case 10: return 3;
         case 11: return 3;
+        case 12: return 3; // advanced_a2b2c rows
+        case 13: return 5; // advanced_abc_plus_de rows
+        case 14: return 6; // advanced_abcg_plus_deg rows
         default: throw std::invalid_argument("unknown HyperPlonk poly_id");
     }
 }
@@ -2185,6 +2221,36 @@ __device__ __forceinline__ u32 eval_poly_at_x_mont(
         u32 b = load_line_mont(tables, len, 1, idx, half, x_mont, q);
         u32 c = load_line_mont(tables, len, 2, idx, half, x_mont, q);
         return prod3(a, b, c);
+    }
+
+
+    if (poly_id == 12) {
+        // advanced_a2b2c u32 full mont: a*a*b*b*c
+        u32 a = load_line_mont(tables, len, 0, idx, half, x_mont, q);
+        u32 b = load_line_mont(tables, len, 1, idx, half, x_mont, q);
+        u32 c = load_line_mont(tables, len, 2, idx, half, x_mont, q);
+        return prod5(a, a, b, b, c);
+    }
+
+    if (poly_id == 13) {
+        // advanced_abc_plus_de u32 full mont: a*b*c + d*e
+        u32 a = load_line_mont(tables, len, 0, idx, half, x_mont, q);
+        u32 b = load_line_mont(tables, len, 1, idx, half, x_mont, q);
+        u32 c = load_line_mont(tables, len, 2, idx, half, x_mont, q);
+        u32 d = load_line_mont(tables, len, 3, idx, half, x_mont, q);
+        u32 e = load_line_mont(tables, len, 4, idx, half, x_mont, q);
+        return add_mod(prod3(a, b, c), prod2(d, e), q);
+    }
+
+    if (poly_id == 14) {
+        // advanced_abcg_plus_deg u32 full mont: a*b*c*g + d*e*g
+        u32 a = load_line_mont(tables, len, 0, idx, half, x_mont, q);
+        u32 b = load_line_mont(tables, len, 1, idx, half, x_mont, q);
+        u32 c = load_line_mont(tables, len, 2, idx, half, x_mont, q);
+        u32 d = load_line_mont(tables, len, 3, idx, half, x_mont, q);
+        u32 e = load_line_mont(tables, len, 4, idx, half, x_mont, q);
+        u32 g = load_line_mont(tables, len, 5, idx, half, x_mont, q);
+        return add_mod(prod4(a, b, c, g), prod3(d, e, g), q);
     }
 
     if (poly_id == 0) {
@@ -3656,6 +3722,36 @@ __device__ __forceinline__ u64 eval_hyperplonk_poly_at_x_mont_u64(
         u64 b = load_line_mont(tables, len, 1, idx, half, x_mont);
         u64 c = load_line_mont(tables, len, 2, idx, half, x_mont);
         return prod3_spec(a, b, c);
+    }
+
+
+    if (poly_id == 12) {
+        // advanced_a2b2c u64 full mont: a*a*b*b*c
+        u64 a = load_line_mont(tables, len, 0, idx, half, x_mont);
+        u64 b = load_line_mont(tables, len, 1, idx, half, x_mont);
+        u64 c = load_line_mont(tables, len, 2, idx, half, x_mont);
+        return prod5_spec(a, a, b, b, c);
+    }
+
+    if (poly_id == 13) {
+        // advanced_abc_plus_de u64 full mont: a*b*c + d*e
+        u64 a = load_line_mont(tables, len, 0, idx, half, x_mont);
+        u64 b = load_line_mont(tables, len, 1, idx, half, x_mont);
+        u64 c = load_line_mont(tables, len, 2, idx, half, x_mont);
+        u64 d = load_line_mont(tables, len, 3, idx, half, x_mont);
+        u64 e = load_line_mont(tables, len, 4, idx, half, x_mont);
+        return add_mod(prod3_spec(a, b, c), prod2_spec(d, e));
+    }
+
+    if (poly_id == 14) {
+        // advanced_abcg_plus_deg u64 full mont: a*b*c*g + d*e*g
+        u64 a = load_line_mont(tables, len, 0, idx, half, x_mont);
+        u64 b = load_line_mont(tables, len, 1, idx, half, x_mont);
+        u64 c = load_line_mont(tables, len, 2, idx, half, x_mont);
+        u64 d = load_line_mont(tables, len, 3, idx, half, x_mont);
+        u64 e = load_line_mont(tables, len, 4, idx, half, x_mont);
+        u64 g = load_line_mont(tables, len, 5, idx, half, x_mont);
+        return add_mod(prod4_spec(a, b, c, g), prod3_spec(d, e, g));
     }
 
     if (poly_id == 0) {

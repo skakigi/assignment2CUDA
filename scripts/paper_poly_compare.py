@@ -19,6 +19,10 @@ POLYS = {
     "baseline_mul_add": [[0, 1], [2]],              # a*b + c
     "baseline_cubic_product": [[0, 1, 2]],          # a*b*c
 
+    "advanced_a2b2c": [[0, 0, 1, 1, 2]],       # a*a*b*b*c
+    "advanced_abc_plus_de": [[0, 1, 2], [3, 4]], # a*b*c + d*e
+    "advanced_abcg_plus_deg": [[0, 1, 2, 5], [3, 4, 5]], # a*b*c*g + d*e*g
+
     # HyperPlonk / zkSpeed-style protocol templates.
     "vanilla_gate": [
         [0, 1],
@@ -72,6 +76,10 @@ FUNCTIONS = {
     "baseline_mul_add": "a*b + c",
     "baseline_cubic_product": "a*b*c",
 
+
+    "advanced_a2b2c": "a*a*b*b*c",
+    "advanced_abc_plus_de": "a*b*c + d*e",
+    "advanced_abcg_plus_deg": "a*b*c*g + d*e*g",
     "vanilla_gate": "qL*w1 + qR*w2 + qM*w1*w2 - qO*w3 + qC",
     "vanilla_zero": "(qL*w1 + qR*w2 + qM*w1*w2 - qO*w3 + qC)*fr",
     "vanilla_perm": "(pi - p1*p2 + alpha_phi*D1*D2*D3 - alpha*N1*N2*N3)*fr",
@@ -94,6 +102,10 @@ POLY_IDS = {
     "baseline_mul": 9,
     "baseline_mul_add": 10,
     "baseline_cubic_product": 11,
+
+    "advanced_a2b2c": 12,
+    "advanced_abc_plus_de": 13,
+    "advanced_abcg_plus_deg": 14,
 }
 
 
@@ -102,6 +114,10 @@ DEFAULT_ORDER = [
     "baseline_mul",
     "baseline_mul_add",
     "baseline_cubic_product",
+
+    "advanced_a2b2c",
+    "advanced_abc_plus_de",
+    "advanced_abcg_plus_deg",
     "vanilla_gate",
     "vanilla_zero",
     "vanilla_perm",

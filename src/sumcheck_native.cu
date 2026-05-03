@@ -3583,7 +3583,435 @@ std::tuple<torch::Tensor, torch::Tensor> sumcheck_terms_full_mont_u64_cuda(
     return std::make_tuple(claim0, output_normal);
 }
 
+
+
+// ============================================================================
+// Specialized u64 full Montgomery-domain SumCheck.
+// Field: q = 2^64 - 2^32 + 1.
+// Uses fixed polynomial templates selected by poly_id.
+// ============================================================================
+
+namespace mont_u64_exp {
+
+__device__ __forceinline__ u64 prod2_spec(u64 a, u64 b) {
+    return mont_mul(a, b);
+}
+
+__device__ __forceinline__ u64 prod3_spec(u64 a, u64 b, u64 c) {
+    return mont_mul(mont_mul(a, b), c);
+}
+
+__device__ __forceinline__ u64 prod4_spec(u64 a, u64 b, u64 c, u64 d) {
+    return mont_mul(mont_mul(mont_mul(a, b), c), d);
+}
+
+__device__ __forceinline__ u64 prod5_spec(u64 a, u64 b, u64 c, u64 d, u64 e) {
+    return mont_mul(mont_mul(mont_mul(mont_mul(a, b), c), d), e);
+}
+
+__device__ __forceinline__ u64 prod7_spec(
+    u64 a,
+    u64 b,
+    u64 c,
+    u64 d,
+    u64 e,
+    u64 f,
+    u64 g) {
+    return mont_mul(mont_mul(prod5_spec(a, b, c, d, e), f), g);
+}
+
+__device__ __forceinline__ u64 eval_hyperplonk_poly_at_x_mont_u64(
+    const u64* __restrict__ tables,
+    int len,
+    int idx,
+    int half,
+    int poly_id,
+    u64 x_mont) {
+
+    u64 acc = 0;
+
+    if (poly_id == 8) {
+        // baseline_linear: a
+        return load_line_mont(tables, len, 0, idx, half, x_mont);
+    }
+
+    if (poly_id == 9) {
+        // baseline_mul: a*b
+        u64 a = load_line_mont(tables, len, 0, idx, half, x_mont);
+        u64 b = load_line_mont(tables, len, 1, idx, half, x_mont);
+        return prod2_spec(a, b);
+    }
+
+    if (poly_id == 10) {
+        // baseline_mul_add: a*b + c
+        u64 a = load_line_mont(tables, len, 0, idx, half, x_mont);
+        u64 b = load_line_mont(tables, len, 1, idx, half, x_mont);
+        u64 c = load_line_mont(tables, len, 2, idx, half, x_mont);
+        return add_mod(prod2_spec(a, b), c);
+    }
+
+    if (poly_id == 11) {
+        // baseline_cubic_product: a*b*c
+        u64 a = load_line_mont(tables, len, 0, idx, half, x_mont);
+        u64 b = load_line_mont(tables, len, 1, idx, half, x_mont);
+        u64 c = load_line_mont(tables, len, 2, idx, half, x_mont);
+        return prod3_spec(a, b, c);
+    }
+
+    if (poly_id == 0) {
+        // vanilla_gate:
+        // qL*w1 + qR*w2 + qM*w1*w2 + neg_qO*w3 + qC
+        u64 qL  = load_line_mont(tables, len, 0, idx, half, x_mont);
+        u64 w1  = load_line_mont(tables, len, 1, idx, half, x_mont);
+        u64 qR  = load_line_mont(tables, len, 2, idx, half, x_mont);
+        u64 w2  = load_line_mont(tables, len, 3, idx, half, x_mont);
+        u64 qM  = load_line_mont(tables, len, 4, idx, half, x_mont);
+        u64 nqO = load_line_mont(tables, len, 5, idx, half, x_mont);
+        u64 w3  = load_line_mont(tables, len, 6, idx, half, x_mont);
+        u64 qC  = load_line_mont(tables, len, 7, idx, half, x_mont);
+
+        acc = add_mod(acc, prod2_spec(qL, w1));
+        acc = add_mod(acc, prod2_spec(qR, w2));
+        acc = add_mod(acc, prod3_spec(qM, w1, w2));
+        acc = add_mod(acc, prod2_spec(nqO, w3));
+        acc = add_mod(acc, qC);
+        return acc;
+    }
+
+    if (poly_id == 1) {
+        // vanilla_zero = vanilla_gate * fr, termwise.
+        u64 qL  = load_line_mont(tables, len, 0, idx, half, x_mont);
+        u64 w1  = load_line_mont(tables, len, 1, idx, half, x_mont);
+        u64 qR  = load_line_mont(tables, len, 2, idx, half, x_mont);
+        u64 w2  = load_line_mont(tables, len, 3, idx, half, x_mont);
+        u64 qM  = load_line_mont(tables, len, 4, idx, half, x_mont);
+        u64 nqO = load_line_mont(tables, len, 5, idx, half, x_mont);
+        u64 w3  = load_line_mont(tables, len, 6, idx, half, x_mont);
+        u64 qC  = load_line_mont(tables, len, 7, idx, half, x_mont);
+        u64 fr  = load_line_mont(tables, len, 8, idx, half, x_mont);
+
+        acc = add_mod(acc, prod3_spec(qL, w1, fr));
+        acc = add_mod(acc, prod3_spec(qR, w2, fr));
+        acc = add_mod(acc, prod4_spec(qM, w1, w2, fr));
+        acc = add_mod(acc, prod3_spec(nqO, w3, fr));
+        acc = add_mod(acc, prod2_spec(qC, fr));
+        return acc;
+    }
+
+    if (poly_id == 2) {
+        // vanilla_perm:
+        // (pi - p1*p2 + alpha_phi*D1*D2*D3 - alpha*N1*N2*N3) * fr
+        // Signs/scalars are folded into input rows.
+        u64 pi   = load_line_mont(tables, len, 0, idx, half, x_mont);
+        u64 np1  = load_line_mont(tables, len, 1, idx, half, x_mont);
+        u64 p2   = load_line_mont(tables, len, 2, idx, half, x_mont);
+        u64 aphi = load_line_mont(tables, len, 3, idx, half, x_mont);
+        u64 D1   = load_line_mont(tables, len, 4, idx, half, x_mont);
+        u64 D2   = load_line_mont(tables, len, 5, idx, half, x_mont);
+        u64 D3   = load_line_mont(tables, len, 6, idx, half, x_mont);
+        u64 nN1  = load_line_mont(tables, len, 7, idx, half, x_mont);
+        u64 N2   = load_line_mont(tables, len, 8, idx, half, x_mont);
+        u64 N3   = load_line_mont(tables, len, 9, idx, half, x_mont);
+        u64 fr   = load_line_mont(tables, len, 10, idx, half, x_mont);
+
+        acc = add_mod(acc, prod2_spec(pi, fr));
+        acc = add_mod(acc, prod3_spec(np1, p2, fr));
+        acc = add_mod(acc, prod5_spec(aphi, D1, D2, D3, fr));
+        acc = add_mod(acc, prod4_spec(nN1, N2, N3, fr));
+        return acc;
+    }
+
+    if (poly_id == 3) {
+        // opencheck_6: y1*k1 + ... + y6*k6
+        #pragma unroll
+        for (int r = 0; r < 6; ++r) {
+            acc = add_mod(
+                acc,
+                load_line_mont(tables, len, r, idx, half, x_mont)
+            );
+        }
+        return acc;
+    }
+
+    if (poly_id == 5 || poly_id == 6 || poly_id == 7) {
+        // degree_sweep:
+        // q1*w1 + q2*w2 + qH*w1^k*w2 + qC
+        u64 q1 = load_line_mont(tables, len, 0, idx, half, x_mont);
+        u64 w1 = load_line_mont(tables, len, 1, idx, half, x_mont);
+        u64 q2 = load_line_mont(tables, len, 2, idx, half, x_mont);
+        u64 w2 = load_line_mont(tables, len, 3, idx, half, x_mont);
+        u64 qH = load_line_mont(tables, len, 4, idx, half, x_mont);
+        u64 qC = load_line_mont(tables, len, 5, idx, half, x_mont);
+
+        acc = add_mod(acc, prod2_spec(q1, w1));
+        acc = add_mod(acc, prod2_spec(q2, w2));
+
+        if (poly_id == 5) {
+            acc = add_mod(acc, prod3_spec(qH, w1, w2));
+        } else if (poly_id == 6) {
+            acc = add_mod(acc, prod5_spec(qH, w1, w1, w1, w2));
+        } else {
+            acc = add_mod(acc, prod7_spec(qH, w1, w1, w1, w1, w1, w2));
+        }
+
+        acc = add_mod(acc, qC);
+        return acc;
+    }
+
+    return 0;
+}
+
+__global__ void eval_hyperplonk_sumcheck_u64_kernel(
+    const u64* __restrict__ tables,
+    int len,
+    int poly_id,
+    int degree,
+    u64* __restrict__ partials) {
+
+    extern __shared__ u64 shared[];
+
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp_id = tid >> 5;
+    const int num_warps = (blockDim.x + 31) >> 5;
+    const int half = len >> 1;
+
+    u64 local[8];
+
+    #pragma unroll
+    for (int x = 0; x < 8; ++x) {
+        local[x] = 0;
+    }
+
+    for (int i = blockIdx.x * blockDim.x + tid;
+         i < half;
+         i += blockDim.x * gridDim.x) {
+
+        for (int x = 0; x <= degree; ++x) {
+            u64 x_mont = to_mont(static_cast<u64>(x));
+
+            u64 y = eval_hyperplonk_poly_at_x_mont_u64(
+                tables,
+                len,
+                i,
+                half,
+                poly_id,
+                x_mont
+            );
+
+            local[x] = add_mod(local[x], y);
+        }
+    }
+
+    for (int x = 0; x <= degree; ++x) {
+        u64 reduced = warp_reduce_add_mod_u64(local[x]);
+        if (lane == 0) {
+            shared[x * num_warps + warp_id] = reduced;
+        }
+    }
+
+    __syncthreads();
+
+    if (warp_id == 0) {
+        for (int x = 0; x <= degree; ++x) {
+            u64 value = 0;
+
+            if (lane < num_warps) {
+                value = shared[x * num_warps + lane];
+            }
+
+            value = warp_reduce_add_mod_u64(value);
+
+            if (lane == 0) {
+                partials[
+                    static_cast<size_t>(blockIdx.x) *
+                    static_cast<size_t>(degree + 1) +
+                    x
+                ] = value;
+            }
+        }
+    }
+}
+
+} // namespace mont_u64_exp
+
+torch::Tensor sumcheck_hyperplonk_full_mont_u64_cuda(
+    torch::Tensor eval_tables,
+    torch::Tensor challenges,
+    uint64_t modulus_hi,
+    uint64_t modulus_lo,
+    int64_t poly_id_64) {
+
+    using namespace mont_u64_exp;
+
+    if (modulus_hi != 0 || modulus_lo != Q64) {
+        throw std::invalid_argument(
+            "u64 Montgomery specialized SumCheck currently requires q = 2^64 - 2^32 + 1"
+        );
+    }
+
+    int poly_id = static_cast<int>(poly_id_64);
+
+    if (poly_id == 4) {
+        throw std::invalid_argument("poly_id 4 is unused");
+    }
+
+    int degree = hp_spec::degree_for_poly(poly_id);
+    int rows = hp_spec::rows_for_poly(poly_id);
+
+    if (!eval_tables.is_cuda()) {
+        throw std::invalid_argument("eval_tables must be CUDA");
+    }
+    if (eval_tables.scalar_type() != torch::kUInt64) {
+        throw std::invalid_argument("eval_tables must be torch.uint64");
+    }
+    if (eval_tables.dim() != 2) {
+        throw std::invalid_argument("eval_tables must have shape (rows, N)");
+    }
+    if (eval_tables.size(0) < rows) {
+        throw std::invalid_argument("eval_tables has too few rows for requested poly_id");
+    }
+    if (!hp_spec::is_power_of_two_i64(eval_tables.size(1))) {
+        throw std::invalid_argument("N must be a power of two");
+    }
+
+    const c10::cuda::CUDAGuard device_guard(eval_tables.device());
+
+    auto normal_tables = eval_tables.narrow(0, 0, rows).contiguous();
+    auto normal_chals =
+        challenges.to(eval_tables.options().dtype(torch::kUInt64)).contiguous();
+
+    int initial_len = static_cast<int>(normal_tables.size(1));
+    int rounds = hp_spec::log2_exact_i64(initial_len);
+
+    if (normal_chals.dim() != 1 || normal_chals.size(0) < rounds) {
+        throw std::invalid_argument("challenges must have shape at least (log2(N),)");
+    }
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    auto current = torch::empty_like(normal_tables);
+    auto chals_mont = torch::empty_like(normal_chals);
+
+    int conv_threads = SUMCHECK_THREADS;
+
+    int conv_blocks_tables = std::min(
+        SUMCHECK_MAX_BLOCKS,
+        static_cast<int>(
+            std::max<int64_t>(
+                1,
+                (normal_tables.numel() + conv_threads - 1) / conv_threads
+            )
+        )
+    );
+
+    int conv_blocks_chals = std::min(
+        SUMCHECK_MAX_BLOCKS,
+        static_cast<int>(
+            std::max<int64_t>(
+                1,
+                (normal_chals.numel() + conv_threads - 1) / conv_threads
+            )
+        )
+    );
+
+    convert_to_mont_u64_kernel<<<conv_blocks_tables, conv_threads, 0, stream>>>(
+        reinterpret_cast<const u64*>(normal_tables.data_ptr<uint64_t>()),
+        static_cast<size_t>(normal_tables.numel()),
+        reinterpret_cast<u64*>(current.data_ptr<uint64_t>()));
+    hp_spec::check_last_cuda("u64 spec convert tables");
+
+    convert_to_mont_u64_kernel<<<conv_blocks_chals, conv_threads, 0, stream>>>(
+        reinterpret_cast<const u64*>(normal_chals.data_ptr<uint64_t>()),
+        static_cast<size_t>(normal_chals.numel()),
+        reinterpret_cast<u64*>(chals_mont.data_ptr<uint64_t>()));
+    hp_spec::check_last_cuda("u64 spec convert challenges");
+
+    auto output_mont =
+        torch::empty({rounds, degree + 1}, normal_tables.options());
+
+    for (int round = 0; round < rounds; ++round) {
+        int len = static_cast<int>(current.size(1));
+        int half = len >> 1;
+
+        int blocks = std::min(
+            SUMCHECK_MAX_BLOCKS,
+            std::max(1, (half + SUMCHECK_THREADS - 1) / SUMCHECK_THREADS)
+        );
+
+        auto partials =
+            torch::empty({blocks, degree + 1}, normal_tables.options());
+
+        size_t shmem =
+            static_cast<size_t>(degree + 1) *
+            SUMCHECK_THREADS *
+            sizeof(u64);
+
+        eval_hyperplonk_sumcheck_u64_kernel<<<blocks, SUMCHECK_THREADS, shmem, stream>>>(
+            reinterpret_cast<const u64*>(current.data_ptr<uint64_t>()),
+            len,
+            poly_id,
+            degree,
+            reinterpret_cast<u64*>(partials.data_ptr<uint64_t>()));
+        hp_spec::check_last_cuda("u64 spec eval");
+
+        reduce_sumcheck_u64_kernel<<<degree + 1, SUMCHECK_THREADS, 0, stream>>>(
+            reinterpret_cast<const u64*>(partials.data_ptr<uint64_t>()),
+            blocks,
+            degree,
+            reinterpret_cast<u64*>(output_mont[round].data_ptr<uint64_t>()));
+        hp_spec::check_last_cuda("u64 spec reduce");
+
+        if (round + 1 < rounds) {
+            auto next = torch::empty({rows, half}, normal_tables.options());
+
+            int upd_blocks = std::min(
+                SUMCHECK_MAX_BLOCKS,
+                std::max(
+                    1,
+                    (rows * half + SUMCHECK_THREADS - 1) / SUMCHECK_THREADS
+                )
+            );
+
+            update_sumcheck_u64_kernel<<<upd_blocks, SUMCHECK_THREADS, 0, stream>>>(
+                reinterpret_cast<const u64*>(current.data_ptr<uint64_t>()),
+                rows,
+                len,
+                reinterpret_cast<const u64*>(chals_mont.data_ptr<uint64_t>()),
+                round,
+                reinterpret_cast<u64*>(next.data_ptr<uint64_t>()));
+            hp_spec::check_last_cuda("u64 spec update");
+
+            current = next;
+        }
+    }
+
+    auto output_normal = torch::empty_like(output_mont);
+
+    int conv_blocks_out = std::min(
+        SUMCHECK_MAX_BLOCKS,
+        static_cast<int>(
+            std::max<int64_t>(
+                1,
+                (output_mont.numel() + conv_threads - 1) / conv_threads
+            )
+        )
+    );
+
+    convert_from_mont_u64_kernel<<<conv_blocks_out, conv_threads, 0, stream>>>(
+        reinterpret_cast<const u64*>(output_mont.data_ptr<uint64_t>()),
+        static_cast<size_t>(output_mont.numel()),
+        reinterpret_cast<u64*>(output_normal.data_ptr<uint64_t>()));
+    hp_spec::check_last_cuda("u64 spec convert output");
+
+    return output_normal;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("sumcheck_hyperplonk_full_mont_u64_cuda",
+          &sumcheck_hyperplonk_full_mont_u64_cuda,
+          "Specialized full Montgomery-domain u64 SumCheck");
+
     m.def("sumcheck_terms_full_mont_u64_cuda",
           &sumcheck_terms_full_mont_u64_cuda,
           "Generic full Montgomery-domain u64 SumCheck");

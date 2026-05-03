@@ -140,6 +140,7 @@ enum class SpecEvalStrategy {
     kMleTiledShared = 1,
     kMleTiledWarp = 2,
     kMleTiledReduceIntrinsics = 3,
+    kCompiledTemplate
 };
 
 // Known fixed-template polynomial IDs used by HyperPlonk-style benchmarks.
@@ -233,8 +234,25 @@ SpecEvalStrategy select_spec_eval_strategy() {
     if (value == "mle_tiled_reduce" || value == "reduce" || value == "intrinsics") {
         return SpecEvalStrategy::kMleTiledReduceIntrinsics;
     }
+    
+    if (value == "compiled" || value == "compile" ||
+        value == "templated" || value == "template") {
+        return SpecEvalStrategy::kCompiledTemplate;
+    }
     return SpecEvalStrategy::kBaselineShared;
 }
+
+inline SpecEvalStrategy resolve_spec_eval_strategy_for_launch(
+    SpecEvalStrategy selected) {
+    // Architectural placeholder: `compiled` is a first-class strategy name,
+    // but compiled-template kernels are added in a later commit.
+    // Until then, keep behavior identical by using the existing baseline path.
+    if (selected == SpecEvalStrategy::kCompiledTemplate) {
+        return SpecEvalStrategy::kBaselineShared;
+    }
+    return selected;
+}
+
 
 inline uint64_t make_barrett_mu_u32_host(uint32_t q) {
     if (q <= 1U) {
@@ -1034,7 +1052,9 @@ int gpu_sumcheck_u32(
     const int32_t total_term_vars = term_offsets[n_terms];
     const int32_t t_count = max_degree + 1;
     const uint64_t q_recip = make_barrett_mu_u32_host(q);
-    const SpecEvalStrategy eval_strategy = select_spec_eval_strategy();
+    const SpecEvalStrategy selected_eval_strategy = select_spec_eval_strategy();
+    const SpecEvalStrategy eval_strategy =
+        resolve_spec_eval_strategy_for_launch(selected_eval_strategy);
     const int eval_threads = eval_threads_for_strategy(eval_strategy);
     const uint64_t eval_block_items = eval_items_per_block_for_strategy(eval_strategy, eval_threads);
     const int reduce_threads = 256;
@@ -1395,7 +1415,9 @@ std::tuple<torch::Tensor, torch::Tensor> torch_sumcheck_terms_u32_cuda(
     auto d_term_vars_t = term_vars_cpu.to(eval_tables.device(), torch::kInt32, false, true);
 
     const uint64_t q_recip = make_barrett_mu_u32_host(q);
-    const SpecEvalStrategy eval_strategy = select_spec_eval_strategy();
+    const SpecEvalStrategy selected_eval_strategy = select_spec_eval_strategy();
+    const SpecEvalStrategy eval_strategy =
+        resolve_spec_eval_strategy_for_launch(selected_eval_strategy);
     const int eval_threads = eval_threads_for_strategy(eval_strategy);
     const uint64_t eval_block_items = eval_items_per_block_for_strategy(eval_strategy, eval_threads);
     const int reduce_threads = 256;

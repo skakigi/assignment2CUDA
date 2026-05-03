@@ -4103,7 +4103,297 @@ torch::Tensor sumcheck_hyperplonk_full_mont_u64_cuda(
     return output_normal;
 }
 
+
+
+// ============================================================================
+// Hashed-challenge support: u64 one-round generic full-Montgomery SumCheck.
+// These entrypoints allow a Python transcript driver to:
+//   1. evaluate one SumCheck round,
+//   2. hash the round evaluations into a challenge,
+//   3. fold the table with that challenge,
+//   4. repeat.
+// ============================================================================
+
+torch::Tensor sumcheck_terms_full_mont_u64_round_eval_cuda(
+    torch::Tensor eval_tables,
+    torch::Tensor term_offsets,
+    torch::Tensor term_vars,
+    uint64_t modulus_hi,
+    uint64_t modulus_lo) {
+
+    using namespace mont_u64_exp;
+
+    if (modulus_hi != 0 || modulus_lo != Q64) {
+        throw std::invalid_argument(
+            "u64 round eval currently requires q = 2^64 - 2^32 + 1"
+        );
+    }
+
+    if (!eval_tables.is_cuda()) {
+        throw std::invalid_argument("eval_tables must be CUDA");
+    }
+    if (eval_tables.scalar_type() != torch::kUInt64) {
+        throw std::invalid_argument("eval_tables must be torch.uint64");
+    }
+    if (eval_tables.dim() != 2) {
+        throw std::invalid_argument("eval_tables must have shape (rows, N)");
+    }
+    if (!hp_spec::is_power_of_two_i64(eval_tables.size(1))) {
+        throw std::invalid_argument("N must be a power of two");
+    }
+    if (eval_tables.size(1) < 2) {
+        throw std::invalid_argument("N must be at least 2 for a SumCheck round");
+    }
+
+    const c10::cuda::CUDAGuard device_guard(eval_tables.device());
+
+    auto offsets_cpu = term_offsets.to(torch::kCPU).to(torch::kInt32).contiguous();
+    auto vars_cpu = term_vars.to(torch::kCPU).to(torch::kInt32).contiguous();
+
+    if (offsets_cpu.dim() != 1 || offsets_cpu.size(0) < 2) {
+        throw std::invalid_argument("term_offsets must be a 1D tensor with at least 2 entries");
+    }
+    if (vars_cpu.dim() != 1) {
+        throw std::invalid_argument("term_vars must be a 1D tensor");
+    }
+
+    int num_terms = static_cast<int>(offsets_cpu.size(0)) - 1;
+    const int32_t* offsets_ptr = offsets_cpu.data_ptr<int32_t>();
+    const int32_t* vars_ptr = vars_cpu.data_ptr<int32_t>();
+
+    int degree = 0;
+    int max_row = -1;
+
+    for (int t = 0; t < num_terms; ++t) {
+        int start = offsets_ptr[t];
+        int end = offsets_ptr[t + 1];
+
+        if (start < 0 || end < start || end > vars_cpu.size(0)) {
+            throw std::invalid_argument("invalid term_offsets");
+        }
+
+        int term_degree = end - start;
+        degree = std::max(degree, term_degree);
+
+        for (int j = start; j < end; ++j) {
+            int row = vars_ptr[j];
+            if (row < 0) {
+                throw std::invalid_argument("term_vars contains a negative row index");
+            }
+            max_row = std::max(max_row, row);
+        }
+    }
+
+    if (degree > 7) {
+        throw std::invalid_argument("u64 round eval currently supports degree <= 7");
+    }
+    if (max_row >= eval_tables.size(0)) {
+        throw std::invalid_argument("term_vars references a row outside eval_tables");
+    }
+
+    auto normal_tables = eval_tables.contiguous();
+
+    auto int_opts_dev =
+        torch::TensorOptions().device(eval_tables.device()).dtype(torch::kInt32);
+
+    auto offsets_dev = term_offsets.to(int_opts_dev).contiguous();
+    auto vars_dev = term_vars.to(int_opts_dev).contiguous();
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    int len = static_cast<int>(normal_tables.size(1));
+    int half = len >> 1;
+
+    auto current_mont = torch::empty_like(normal_tables);
+
+    int conv_threads = SUMCHECK_THREADS;
+    int conv_blocks_tables = std::min(
+        SUMCHECK_MAX_BLOCKS,
+        static_cast<int>(
+            std::max<int64_t>(
+                1,
+                (normal_tables.numel() + conv_threads - 1) / conv_threads
+            )
+        )
+    );
+
+    convert_to_mont_u64_kernel<<<conv_blocks_tables, conv_threads, 0, stream>>>(
+        reinterpret_cast<const u64*>(normal_tables.data_ptr<uint64_t>()),
+        static_cast<size_t>(normal_tables.numel()),
+        reinterpret_cast<u64*>(current_mont.data_ptr<uint64_t>()));
+    hp_spec::check_last_cuda("hashed u64 round convert tables");
+
+    int blocks = std::min(
+        SUMCHECK_MAX_BLOCKS,
+        std::max(1, (half + SUMCHECK_THREADS - 1) / SUMCHECK_THREADS)
+    );
+
+    auto partials = torch::empty({blocks, degree + 1}, normal_tables.options());
+    auto output_mont = torch::empty({degree + 1}, normal_tables.options());
+
+    size_t shmem =
+        static_cast<size_t>(degree + 1) *
+        SUMCHECK_THREADS *
+        sizeof(u64);
+
+    eval_terms_sumcheck_u64_kernel<<<blocks, SUMCHECK_THREADS, shmem, stream>>>(
+        reinterpret_cast<const u64*>(current_mont.data_ptr<uint64_t>()),
+        len,
+        reinterpret_cast<const int32_t*>(offsets_dev.data_ptr<int32_t>()),
+        reinterpret_cast<const int32_t*>(vars_dev.data_ptr<int32_t>()),
+        num_terms,
+        degree,
+        reinterpret_cast<u64*>(partials.data_ptr<uint64_t>()));
+    hp_spec::check_last_cuda("hashed u64 round eval");
+
+    reduce_sumcheck_u64_kernel<<<degree + 1, SUMCHECK_THREADS, 0, stream>>>(
+        reinterpret_cast<const u64*>(partials.data_ptr<uint64_t>()),
+        blocks,
+        degree,
+        reinterpret_cast<u64*>(output_mont.data_ptr<uint64_t>()));
+    hp_spec::check_last_cuda("hashed u64 round reduce");
+
+    auto output_normal = torch::empty_like(output_mont);
+
+    int conv_blocks_out = std::min(
+        SUMCHECK_MAX_BLOCKS,
+        static_cast<int>(
+            std::max<int64_t>(
+                1,
+                (output_mont.numel() + conv_threads - 1) / conv_threads
+            )
+        )
+    );
+
+    convert_from_mont_u64_kernel<<<conv_blocks_out, conv_threads, 0, stream>>>(
+        reinterpret_cast<const u64*>(output_mont.data_ptr<uint64_t>()),
+        static_cast<size_t>(output_mont.numel()),
+        reinterpret_cast<u64*>(output_normal.data_ptr<uint64_t>()));
+    hp_spec::check_last_cuda("hashed u64 round convert output");
+
+    return output_normal;
+}
+
+torch::Tensor fold_full_mont_u64_cuda(
+    torch::Tensor eval_tables,
+    torch::Tensor challenge,
+    uint64_t modulus_hi,
+    uint64_t modulus_lo) {
+
+    using namespace mont_u64_exp;
+
+    if (modulus_hi != 0 || modulus_lo != Q64) {
+        throw std::invalid_argument(
+            "u64 fold currently requires q = 2^64 - 2^32 + 1"
+        );
+    }
+
+    if (!eval_tables.is_cuda()) {
+        throw std::invalid_argument("eval_tables must be CUDA");
+    }
+    if (eval_tables.scalar_type() != torch::kUInt64) {
+        throw std::invalid_argument("eval_tables must be torch.uint64");
+    }
+    if (eval_tables.dim() != 2) {
+        throw std::invalid_argument("eval_tables must have shape (rows, N)");
+    }
+    if (!hp_spec::is_power_of_two_i64(eval_tables.size(1))) {
+        throw std::invalid_argument("N must be a power of two");
+    }
+    if (eval_tables.size(1) < 2) {
+        throw std::invalid_argument("N must be at least 2 for folding");
+    }
+
+    const c10::cuda::CUDAGuard device_guard(eval_tables.device());
+
+    auto normal_tables = eval_tables.contiguous();
+    auto normal_chal = challenge.to(eval_tables.options().dtype(torch::kUInt64)).contiguous();
+
+    if (normal_chal.numel() < 1) {
+        throw std::invalid_argument("challenge must contain at least one value");
+    }
+
+    int rows = static_cast<int>(normal_tables.size(0));
+    int len = static_cast<int>(normal_tables.size(1));
+    int half = len >> 1;
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    auto tables_mont = torch::empty_like(normal_tables);
+    auto chal_mont = torch::empty({1}, normal_tables.options());
+
+    int conv_threads = SUMCHECK_THREADS;
+
+    int conv_blocks_tables = std::min(
+        SUMCHECK_MAX_BLOCKS,
+        static_cast<int>(
+            std::max<int64_t>(
+                1,
+                (normal_tables.numel() + conv_threads - 1) / conv_threads
+            )
+        )
+    );
+
+    convert_to_mont_u64_kernel<<<conv_blocks_tables, conv_threads, 0, stream>>>(
+        reinterpret_cast<const u64*>(normal_tables.data_ptr<uint64_t>()),
+        static_cast<size_t>(normal_tables.numel()),
+        reinterpret_cast<u64*>(tables_mont.data_ptr<uint64_t>()));
+    hp_spec::check_last_cuda("hashed u64 fold convert tables");
+
+    convert_to_mont_u64_kernel<<<1, 1, 0, stream>>>(
+        reinterpret_cast<const u64*>(normal_chal.data_ptr<uint64_t>()),
+        static_cast<size_t>(1),
+        reinterpret_cast<u64*>(chal_mont.data_ptr<uint64_t>()));
+    hp_spec::check_last_cuda("hashed u64 fold convert challenge");
+
+    auto next_mont = torch::empty({rows, half}, normal_tables.options());
+
+    int upd_blocks = std::min(
+        SUMCHECK_MAX_BLOCKS,
+        std::max(
+            1,
+            (rows * half + SUMCHECK_THREADS - 1) / SUMCHECK_THREADS
+        )
+    );
+
+    update_sumcheck_u64_kernel<<<upd_blocks, SUMCHECK_THREADS, 0, stream>>>(
+        reinterpret_cast<const u64*>(tables_mont.data_ptr<uint64_t>()),
+        rows,
+        len,
+        reinterpret_cast<const u64*>(chal_mont.data_ptr<uint64_t>()),
+        0,
+        reinterpret_cast<u64*>(next_mont.data_ptr<uint64_t>()));
+    hp_spec::check_last_cuda("hashed u64 fold update");
+
+    auto next_normal = torch::empty_like(next_mont);
+
+    int conv_blocks_out = std::min(
+        SUMCHECK_MAX_BLOCKS,
+        static_cast<int>(
+            std::max<int64_t>(
+                1,
+                (next_mont.numel() + conv_threads - 1) / conv_threads
+            )
+        )
+    );
+
+    convert_from_mont_u64_kernel<<<conv_blocks_out, conv_threads, 0, stream>>>(
+        reinterpret_cast<const u64*>(next_mont.data_ptr<uint64_t>()),
+        static_cast<size_t>(next_mont.numel()),
+        reinterpret_cast<u64*>(next_normal.data_ptr<uint64_t>()));
+    hp_spec::check_last_cuda("hashed u64 fold convert output");
+
+    return next_normal;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("sumcheck_terms_full_mont_u64_round_eval_cuda",
+          &sumcheck_terms_full_mont_u64_round_eval_cuda,
+          "One-round generic full Montgomery-domain u64 SumCheck evaluation");
+    m.def("fold_full_mont_u64_cuda",
+          &fold_full_mont_u64_cuda,
+          "One-round full Montgomery-domain u64 MLE fold");
+
     m.def("sumcheck_hyperplonk_full_mont_u64_cuda",
           &sumcheck_hyperplonk_full_mont_u64_cuda,
           "Specialized full Montgomery-domain u64 SumCheck");

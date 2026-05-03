@@ -20,7 +20,7 @@
 // ============================================================================
 
 #ifndef SUMCHECK_EXPERIMENTAL_MONTGOMERY_MUL
-#define SUMCHECK_EXPERIMENTAL_MONTGOMERY_MUL 1
+#define SUMCHECK_EXPERIMENTAL_MONTGOMERY_MUL 0
 #endif
 
 __device__ __forceinline__ uint32_t sumcheck_mont_redc_q32(uint64_t t) {
@@ -1537,11 +1537,7 @@ __device__ __forceinline__ u32 reduce_q32_fast(u64 z) {
 __device__ __forceinline__ u32 mul_mod(u32 a, u32 b, u32 q) {
     u64 z = static_cast<u64>(a) * static_cast<u64>(b);
     if (q == Q32_FAST) {
-#if SUMCHECK_EXPERIMENTAL_MONTGOMERY_MUL
-        return sumcheck_mont_mul_normal_q32(a, b);
-#else
         return reduce_q32_fast(z);
-#endif
     }
     return static_cast<u32>(z % static_cast<u64>(q));
 }

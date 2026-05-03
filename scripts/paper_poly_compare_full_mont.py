@@ -116,9 +116,9 @@ def main():
         "template",
         "N",
         "deg",
-        "wrapped_generic_ms",
+        "regular_generic_ms",
         "full_generic_ms",
-        "wrapped_spec_ms",
+        "regular_spec_ms",
         "full_spec_ms",
         "full_generic_speed",
         "full_spec_speed",
@@ -145,31 +145,31 @@ def main():
                 args.seed + nv + base.POLY_IDS[poly] * 100,
             )
 
-            wrapped_generic_fn = base.build_generic_call(tables, chals, terms)
+            regular_generic_fn = base.build_generic_call(tables, chals, terms)
             full_generic_fn = build_full_mont_generic_call(tables, chals, terms)
-            wrapped_spec_fn = base.build_specialized_call(tables, chals, poly)
+            regular_spec_fn = base.build_specialized_call(tables, chals, poly)
             full_spec_fn = build_full_mont_specialized_call(tables, chals, poly)
 
-            _wgf, wgmed, _wgp90, wgout = bench(wrapped_generic_fn, args.warmup, args.runs)
+            _rgf, rgmed, _rgp90, rgout = bench(regular_generic_fn, args.warmup, args.runs)
             _fgf, fgmed, _fgp90, fgout = bench(full_generic_fn, args.warmup, args.runs)
-            _wsf, wsmed, _wsp90, wsout = bench(wrapped_spec_fn, args.warmup, args.runs)
+            _rsf, rsmed, _rsp90, rsout = bench(regular_spec_fn, args.warmup, args.runs)
             _fsf, fsmed, _fsp90, fsout = bench(full_spec_fn, args.warmup, args.runs)
 
             if args.check:
-                ref = wgout.detach().cpu()
+                ref = rgout.detach().cpu()
                 fg = fgout.detach().cpu()
-                ws = wsout.detach().cpu()
+                ws = rsout.detach().cpu()
                 fs = fsout.detach().cpu()
 
                 for label, val in [
                     ("full_generic", fg),
-                    ("wrapped_spec", ws),
+                    ("regular_spec", ws),
                     ("full_spec", fs),
                 ]:
                     if not torch.equal(ref, val):
                         diff = (ref != val).nonzero()[0].tolist()
                         raise AssertionError(
-                            f"wrapped_generic/{label} mismatch {poly} nv={nv} first={diff}"
+                            f"regular_generic/{label} mismatch {poly} nv={nv} first={diff}"
                         )
 
             n = 1 << nv
@@ -178,13 +178,13 @@ def main():
                 poly,
                 f"{n:d}",
                 f"{base.degree_for_terms(terms):d}",
-                f"{wgmed:.3f}",
+                f"{rgmed:.3f}",
                 f"{fgmed:.3f}",
-                f"{wsmed:.3f}",
+                f"{rsmed:.3f}",
                 f"{fsmed:.3f}",
-                f"{wgmed / fgmed:.2f}x",
-                f"{wgmed / fsmed:.2f}x",
-                str(tuple(wgout.shape)),
+                f"{rgmed / fgmed:.2f}x",
+                f"{rgmed / fsmed:.2f}x",
+                str(tuple(rgout.shape)),
             ]
 
             print(fmt_row(row, widths))

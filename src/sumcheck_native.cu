@@ -149,7 +149,6 @@ enum PolyTemplateId : int {
     kPolyVanillaZero = 1,
     kPolyVanillaPerm = 2,
     kPolyOpencheck6 = 3,
-    kPolyAdvancedXConst = 4,
 
     kPolyDegreeSweepDeg3 = 5,
     kPolyDegreeSweepDeg5 = 6,
@@ -1691,50 +1690,6 @@ __device__ __forceinline__ u32 eval_poly_at_x(
         return acc;
     }
 
-    if (poly_id == kPolyAdvancedXConst) {
-        // jellyfish_zero structural template.
-        u32 q1 = load_line(tables, len, 0, idx, half, x, q);
-        u32 w1 = load_line(tables, len, 1, idx, half, x, q);
-        u32 q2 = load_line(tables, len, 2, idx, half, x, q);
-        u32 w2 = load_line(tables, len, 3, idx, half, x, q);
-        u32 q3 = load_line(tables, len, 4, idx, half, x, q);
-        u32 w3 = load_line(tables, len, 5, idx, half, x, q);
-        u32 q4 = load_line(tables, len, 6, idx, half, x, q);
-        u32 w4 = load_line(tables, len, 7, idx, half, x, q);
-        u32 qM1 = load_line(tables, len, 8, idx, half, x, q);
-        u32 qM2 = load_line(tables, len, 9, idx, half, x, q);
-        u32 qH1 = load_line(tables, len, 10, idx, half, x, q);
-        u32 qH2 = load_line(tables, len, 11, idx, half, x, q);
-        u32 qH3 = load_line(tables, len, 12, idx, half, x, q);
-        u32 qH4 = load_line(tables, len, 13, idx, half, x, q);
-        u32 nqO = load_line(tables, len, 14, idx, half, x, q);
-        u32 w5 = load_line(tables, len, 15, idx, half, x, q);
-        u32 qECC = load_line(tables, len, 16, idx, half, x, q);
-        u32 fr = load_line(tables, len, 17, idx, half, x, q);
-        u32 qC = load_line(tables, len, 18, idx, half, x, q);
-
-        acc = add_mod(acc, prod3(q1, w1, fr, q), q);
-        acc = add_mod(acc, prod3(q2, w2, fr, q), q);
-        acc = add_mod(acc, prod3(q3, w3, fr, q), q);
-        acc = add_mod(acc, prod3(q4, w4, fr, q), q);
-        acc = add_mod(acc, prod4(qM1, w1, w2, fr, q), q);
-        acc = add_mod(acc, prod4(qM2, w3, w4, fr, q), q);
-
-        u32 w1_5 = prod5(w1, w1, w1, w1, w1, q);
-        u32 w2_5 = prod5(w2, w2, w2, w2, w2, q);
-        u32 w3_5 = prod5(w3, w3, w3, w3, w3, q);
-        u32 w4_5 = prod5(w4, w4, w4, w4, w4, q);
-
-        acc = add_mod(acc, prod3(qH1, w1_5, fr, q), q);
-        acc = add_mod(acc, prod3(qH2, w2_5, fr, q), q);
-        acc = add_mod(acc, prod3(qH3, w3_5, fr, q), q);
-        acc = add_mod(acc, prod3(qH4, w4_5, fr, q), q);
-        acc = add_mod(acc, prod3(nqO, w5, fr, q), q);
-        acc = add_mod(acc, prod6(qECC, w1, w2, w3, w4, fr, q), q);
-        acc = add_mod(acc, prod2(qC, fr, q), q);
-
-        return acc;
-    }
 
     if (poly_id == kPolyBaselineLinear) {
         // baseline_linear: a
@@ -1981,7 +1936,6 @@ int degree_for_poly(int poly_id) {
         case kPolyVanillaZero: return 4; // vanilla_zero
         case kPolyVanillaPerm: return 5; // vanilla_perm
         case kPolyOpencheck6: return 1; // opencheck_6
-        case kPolyAdvancedXConst: return 7; // jellyfish_zero
         case kPolyDegreeSweepDeg3: return 3; // custom_gate_deg3
         case kPolyDegreeSweepDeg5: return 5; // custom_gate_deg5
         case kPolyDegreeSweepDeg7: return 7; // custom_gate_deg7
@@ -2002,7 +1956,6 @@ int rows_for_poly(int poly_id) {
         case kPolyVanillaZero: return 9;
         case kPolyVanillaPerm: return 11;
         case kPolyOpencheck6: return 6;
-        case kPolyAdvancedXConst: return 19;
         case kPolyDegreeSweepDeg3: return 6;
         case kPolyDegreeSweepDeg5: return 6;
         case kPolyDegreeSweepDeg7: return 6;
@@ -2550,9 +2503,6 @@ torch::Tensor sumcheck_hyperplonk_full_mont_u32_cuda(
 
     int poly_id = static_cast<int>(poly_id_64);
 
-    if (poly_id == kPolyAdvancedXConst) {
-        throw std::invalid_argument("poly_id 4 is unused and not supported by full Montgomery path");
-    }
 
     int degree = hp_spec::degree_for_poly(poly_id);
     int rows = hp_spec::rows_for_poly(poly_id);
@@ -3979,9 +3929,6 @@ torch::Tensor sumcheck_hyperplonk_full_mont_u64_cuda(
 
     int poly_id = static_cast<int>(poly_id_64);
 
-    if (poly_id == kPolyAdvancedXConst) {
-        throw std::invalid_argument("poly_id 4 is unused");
-    }
 
     int degree = hp_spec::degree_for_poly(poly_id);
     int rows = hp_spec::rows_for_poly(poly_id);
@@ -5638,9 +5585,6 @@ std::tuple<torch::Tensor, torch::Tensor> sumcheck_hyperplonk_full_mont_u128_cuda
 
     int poly_id = static_cast<int>(poly_id_64);
 
-    if (poly_id == kPolyAdvancedXConst) {
-        throw std::invalid_argument("poly_id 4 is unused");
-    }
 
     int degree = hp_spec::degree_for_poly(poly_id);
     int rows = hp_spec::rows_for_poly(poly_id);

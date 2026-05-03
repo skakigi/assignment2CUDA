@@ -4386,7 +4386,257 @@ torch::Tensor fold_full_mont_u64_cuda(
     return next_normal;
 }
 
+
+
+// ============================================================================
+// u128 Montgomery arithmetic experiment.
+// Field: q = 2^128 - 159
+// q = 0xffffffffffffffff_ffffffffffffff61
+//
+// Representation:
+//   value = hi * 2^64 + lo
+//
+// This block adds a multiplication smoke-test entrypoint:
+//   montgomery_u128_mul_test_cuda(a_lo, a_hi, b_lo, b_hi)
+// ============================================================================
+
+namespace mont_u128_exp {
+
+using u64 = uint64_t;
+
+struct u128x {
+    u64 lo;
+    u64 hi;
+};
+
+constexpr u64 Q_LO = 0xffffffffffffff61ULL;
+constexpr u64 Q_HI = 0xffffffffffffffffULL;
+
+// nprime = -q^{-1} mod 2^64, where q0 = Q_LO.
+constexpr u64 NPRIME = 0xb5efe63d2eb11b5fULL;
+
+// R^2 mod q, with R = 2^128.
+// Since q = 2^128 - 159, R mod q = 159 and R^2 mod q = 159^2 = 25281.
+constexpr u64 R2_LO = 0x00000000000062c1ULL;
+constexpr u64 R2_HI = 0x0000000000000000ULL;
+
+__device__ __forceinline__ bool ge_q(u128x a) {
+    return (a.hi > Q_HI) || (a.hi == Q_HI && a.lo >= Q_LO);
+}
+
+__device__ __forceinline__ u128x sub_q(u128x a) {
+    u64 lo = a.lo - Q_LO;
+    u64 borrow = (a.lo < Q_LO) ? 1ULL : 0ULL;
+    u64 hi = a.hi - Q_HI - borrow;
+    return {lo, hi};
+}
+
+__device__ __forceinline__ u128x add_small(u128x a, u64 c) {
+    u64 old = a.lo;
+    a.lo += c;
+    if (a.lo < old) {
+        a.hi += 1ULL;
+    }
+    return a;
+}
+
+__device__ __forceinline__ u128x normalize(u128x a, u64 high_extra) {
+    // After 2-limb REDC, result is less than 2q.
+    // If the 129th bit is set, subtracting q is equivalent to adding 159.
+    if (high_extra) {
+        a = add_small(a, 159ULL);
+    }
+
+    if (ge_q(a)) {
+        a = sub_q(a);
+    }
+    if (ge_q(a)) {
+        a = sub_q(a);
+    }
+    return a;
+}
+
+__device__ __forceinline__ void add_limb(u64 t[6], int idx, u64 v) {
+    u64 old = t[idx];
+    t[idx] += v;
+    u64 carry = (t[idx] < old) ? 1ULL : 0ULL;
+
+    while (carry && idx + 1 < 6) {
+        ++idx;
+        old = t[idx];
+        t[idx] += 1ULL;
+        carry = (t[idx] == 0ULL) ? 1ULL : 0ULL;
+    }
+}
+
+__device__ __forceinline__ void addmul_limb(u64 t[6], int idx, u64 a, u64 b) {
+    u64 lo = a * b;
+    u64 hi = __umul64hi(a, b);
+
+    add_limb(t, idx, lo);
+    add_limb(t, idx + 1, hi);
+}
+
+__device__ __forceinline__ void shift_right_limb(u64 t[6]) {
+    t[0] = t[1];
+    t[1] = t[2];
+    t[2] = t[3];
+    t[3] = t[4];
+    t[4] = t[5];
+    t[5] = 0ULL;
+}
+
+__device__ __forceinline__ u128x redc_256(u64 t[6]) {
+    // Two-limb CIOS Montgomery REDC.
+    // Base b = 2^64, modulus q has limbs Q_LO, Q_HI.
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        u64 m = t[0] * NPRIME;
+
+        addmul_limb(t, 0, m, Q_LO);
+        addmul_limb(t, 1, m, Q_HI);
+
+        // t[0] is zero modulo 2^64 now; divide by b.
+        shift_right_limb(t);
+    }
+
+    u128x out{t[0], t[1]};
+    return normalize(out, t[2]);
+}
+
+__device__ __forceinline__ u128x mont_mul(u128x a, u128x b) {
+    u64 t[6];
+
+    #pragma unroll
+    for (int i = 0; i < 6; ++i) {
+        t[i] = 0ULL;
+    }
+
+    addmul_limb(t, 0, a.lo, b.lo);
+    addmul_limb(t, 1, a.lo, b.hi);
+    addmul_limb(t, 1, a.hi, b.lo);
+    addmul_limb(t, 2, a.hi, b.hi);
+
+    return redc_256(t);
+}
+
+__device__ __forceinline__ u128x to_mont(u128x a) {
+    u128x r2{R2_LO, R2_HI};
+    return mont_mul(a, r2);
+}
+
+__device__ __forceinline__ u128x from_mont(u128x a_mont) {
+    u64 t[6];
+
+    #pragma unroll
+    for (int i = 0; i < 6; ++i) {
+        t[i] = 0ULL;
+    }
+
+    t[0] = a_mont.lo;
+    t[1] = a_mont.hi;
+
+    return redc_256(t);
+}
+
+__device__ __forceinline__ u128x mul_normal(u128x a, u128x b) {
+    u128x am = to_mont(a);
+    u128x bm = to_mont(b);
+    u128x cm = mont_mul(am, bm);
+    return from_mont(cm);
+}
+
+__global__ void mul_test_kernel(
+    const u64* __restrict__ a_lo,
+    const u64* __restrict__ a_hi,
+    const u64* __restrict__ b_lo,
+    const u64* __restrict__ b_hi,
+    u64* __restrict__ out_lo,
+    u64* __restrict__ out_hi,
+    size_t n) {
+
+    for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < n;
+         i += static_cast<size_t>(gridDim.x) * blockDim.x) {
+
+        u128x a{a_lo[i], a_hi[i]};
+        u128x b{b_lo[i], b_hi[i]};
+
+        u128x c = mul_normal(a, b);
+
+        out_lo[i] = c.lo;
+        out_hi[i] = c.hi;
+    }
+}
+
+} // namespace mont_u128_exp
+
+std::tuple<torch::Tensor, torch::Tensor> montgomery_u128_mul_test_cuda(
+    torch::Tensor a_lo,
+    torch::Tensor a_hi,
+    torch::Tensor b_lo,
+    torch::Tensor b_hi) {
+
+    using namespace mont_u128_exp;
+
+    if (!a_lo.is_cuda() || !a_hi.is_cuda() || !b_lo.is_cuda() || !b_hi.is_cuda()) {
+        throw std::invalid_argument("all input tensors must be CUDA tensors");
+    }
+
+    if (a_lo.scalar_type() != torch::kUInt64 ||
+        a_hi.scalar_type() != torch::kUInt64 ||
+        b_lo.scalar_type() != torch::kUInt64 ||
+        b_hi.scalar_type() != torch::kUInt64) {
+        throw std::invalid_argument("all input tensors must be torch.uint64");
+    }
+
+    if (a_lo.sizes() != a_hi.sizes() ||
+        a_lo.sizes() != b_lo.sizes() ||
+        a_lo.sizes() != b_hi.sizes()) {
+        throw std::invalid_argument("all input tensors must have the same shape");
+    }
+
+    const c10::cuda::CUDAGuard device_guard(a_lo.device());
+
+    auto alo = a_lo.contiguous();
+    auto ahi = a_hi.contiguous();
+    auto blo = b_lo.contiguous();
+    auto bhi = b_hi.contiguous();
+
+    auto out_lo = torch::empty_like(alo);
+    auto out_hi = torch::empty_like(ahi);
+
+    constexpr int THREADS = 128;
+    constexpr int MAX_BLOCKS = 4096;
+
+    size_t n = static_cast<size_t>(alo.numel());
+
+    int blocks = std::min<int>(
+        MAX_BLOCKS,
+        std::max<int>(1, static_cast<int>((n + THREADS - 1) / THREADS))
+    );
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    mul_test_kernel<<<blocks, THREADS, 0, stream>>>(
+        reinterpret_cast<const u64*>(alo.data_ptr<uint64_t>()),
+        reinterpret_cast<const u64*>(ahi.data_ptr<uint64_t>()),
+        reinterpret_cast<const u64*>(blo.data_ptr<uint64_t>()),
+        reinterpret_cast<const u64*>(bhi.data_ptr<uint64_t>()),
+        reinterpret_cast<u64*>(out_lo.data_ptr<uint64_t>()),
+        reinterpret_cast<u64*>(out_hi.data_ptr<uint64_t>()),
+        n);
+
+    hp_spec::check_last_cuda("montgomery_u128_mul_test_cuda");
+
+    return std::make_tuple(out_lo, out_hi);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("montgomery_u128_mul_test_cuda",
+          &montgomery_u128_mul_test_cuda,
+          "u128 Montgomery modular multiplication smoke test");
+
     m.def("sumcheck_terms_full_mont_u64_round_eval_cuda",
           &sumcheck_terms_full_mont_u64_round_eval_cuda,
           "One-round generic full Montgomery-domain u64 SumCheck evaluation");

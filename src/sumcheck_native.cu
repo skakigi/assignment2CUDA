@@ -5295,7 +5295,508 @@ sumcheck_terms_full_mont_u128_cuda(
     return std::make_tuple(claim_lo, claim_hi, output_lo, output_hi);
 }
 
+
+
+// ============================================================================
+// Specialized u128 full Montgomery-domain SumCheck.
+// Field: q = 2^128 - 159.
+// Uses fixed polynomial templates selected by poly_id.
+// ============================================================================
+
+namespace mont_u128_exp {
+
+__device__ __forceinline__ u128x prod2_spec_u128(u128x a, u128x b) {
+    return mont_mul(a, b);
+}
+
+__device__ __forceinline__ u128x prod3_spec_u128(u128x a, u128x b, u128x c) {
+    return mont_mul(mont_mul(a, b), c);
+}
+
+__device__ __forceinline__ u128x prod4_spec_u128(u128x a, u128x b, u128x c, u128x d) {
+    return mont_mul(mont_mul(mont_mul(a, b), c), d);
+}
+
+__device__ __forceinline__ u128x prod5_spec_u128(u128x a, u128x b, u128x c, u128x d, u128x e) {
+    return mont_mul(mont_mul(mont_mul(mont_mul(a, b), c), d), e);
+}
+
+__device__ __forceinline__ u128x prod7_spec_u128(
+    u128x a,
+    u128x b,
+    u128x c,
+    u128x d,
+    u128x e,
+    u128x f,
+    u128x g) {
+    return mont_mul(mont_mul(prod5_spec_u128(a, b, c, d, e), f), g);
+}
+
+__device__ __forceinline__ u128x eval_hyperplonk_poly_at_x_mont_u128(
+    const u64* __restrict__ tables_lo,
+    const u64* __restrict__ tables_hi,
+    int len,
+    int idx,
+    int half,
+    int poly_id,
+    u128x x_mont) {
+
+    u128x acc{0ULL, 0ULL};
+
+    if (poly_id == 8) {
+        // baseline_linear: a
+        return load_line_mont_u128(tables_lo, tables_hi, len, 0, idx, half, x_mont);
+    }
+
+    if (poly_id == 9) {
+        // baseline_mul: a*b
+        u128x a = load_line_mont_u128(tables_lo, tables_hi, len, 0, idx, half, x_mont);
+        u128x b = load_line_mont_u128(tables_lo, tables_hi, len, 1, idx, half, x_mont);
+        return prod2_spec_u128(a, b);
+    }
+
+    if (poly_id == 10) {
+        // baseline_mul_add: a*b + c
+        u128x a = load_line_mont_u128(tables_lo, tables_hi, len, 0, idx, half, x_mont);
+        u128x b = load_line_mont_u128(tables_lo, tables_hi, len, 1, idx, half, x_mont);
+        u128x c = load_line_mont_u128(tables_lo, tables_hi, len, 2, idx, half, x_mont);
+        return add_mod_u128(prod2_spec_u128(a, b), c);
+    }
+
+    if (poly_id == 11) {
+        // baseline_cubic_product: a*b*c
+        u128x a = load_line_mont_u128(tables_lo, tables_hi, len, 0, idx, half, x_mont);
+        u128x b = load_line_mont_u128(tables_lo, tables_hi, len, 1, idx, half, x_mont);
+        u128x c = load_line_mont_u128(tables_lo, tables_hi, len, 2, idx, half, x_mont);
+        return prod3_spec_u128(a, b, c);
+    }
+
+    if (poly_id == 12) {
+        // advanced_a2b2c: a*a*b*b*c
+        u128x a = load_line_mont_u128(tables_lo, tables_hi, len, 0, idx, half, x_mont);
+        u128x b = load_line_mont_u128(tables_lo, tables_hi, len, 1, idx, half, x_mont);
+        u128x c = load_line_mont_u128(tables_lo, tables_hi, len, 2, idx, half, x_mont);
+        return prod5_spec_u128(a, a, b, b, c);
+    }
+
+    if (poly_id == 13) {
+        // advanced_abc_plus_de: a*b*c + d*e
+        u128x a = load_line_mont_u128(tables_lo, tables_hi, len, 0, idx, half, x_mont);
+        u128x b = load_line_mont_u128(tables_lo, tables_hi, len, 1, idx, half, x_mont);
+        u128x c = load_line_mont_u128(tables_lo, tables_hi, len, 2, idx, half, x_mont);
+        u128x d = load_line_mont_u128(tables_lo, tables_hi, len, 3, idx, half, x_mont);
+        u128x e = load_line_mont_u128(tables_lo, tables_hi, len, 4, idx, half, x_mont);
+        return add_mod_u128(prod3_spec_u128(a, b, c), prod2_spec_u128(d, e));
+    }
+
+    if (poly_id == 14) {
+        // advanced_abcg_plus_deg: a*b*c*g + d*e*g
+        u128x a = load_line_mont_u128(tables_lo, tables_hi, len, 0, idx, half, x_mont);
+        u128x b = load_line_mont_u128(tables_lo, tables_hi, len, 1, idx, half, x_mont);
+        u128x c = load_line_mont_u128(tables_lo, tables_hi, len, 2, idx, half, x_mont);
+        u128x d = load_line_mont_u128(tables_lo, tables_hi, len, 3, idx, half, x_mont);
+        u128x e = load_line_mont_u128(tables_lo, tables_hi, len, 4, idx, half, x_mont);
+        u128x g = load_line_mont_u128(tables_lo, tables_hi, len, 5, idx, half, x_mont);
+        return add_mod_u128(prod4_spec_u128(a, b, c, g), prod3_spec_u128(d, e, g));
+    }
+
+    if (poly_id == 0) {
+        // vanilla_gate:
+        // qL*w1 + qR*w2 + qM*w1*w2 + neg_qO*w3 + qC
+        u128x qL  = load_line_mont_u128(tables_lo, tables_hi, len, 0, idx, half, x_mont);
+        u128x w1  = load_line_mont_u128(tables_lo, tables_hi, len, 1, idx, half, x_mont);
+        u128x qR  = load_line_mont_u128(tables_lo, tables_hi, len, 2, idx, half, x_mont);
+        u128x w2  = load_line_mont_u128(tables_lo, tables_hi, len, 3, idx, half, x_mont);
+        u128x qM  = load_line_mont_u128(tables_lo, tables_hi, len, 4, idx, half, x_mont);
+        u128x nqO = load_line_mont_u128(tables_lo, tables_hi, len, 5, idx, half, x_mont);
+        u128x w3  = load_line_mont_u128(tables_lo, tables_hi, len, 6, idx, half, x_mont);
+        u128x qC  = load_line_mont_u128(tables_lo, tables_hi, len, 7, idx, half, x_mont);
+
+        acc = add_mod_u128(acc, prod2_spec_u128(qL, w1));
+        acc = add_mod_u128(acc, prod2_spec_u128(qR, w2));
+        acc = add_mod_u128(acc, prod3_spec_u128(qM, w1, w2));
+        acc = add_mod_u128(acc, prod2_spec_u128(nqO, w3));
+        acc = add_mod_u128(acc, qC);
+        return acc;
+    }
+
+    if (poly_id == 1) {
+        // vanilla_zero = vanilla_gate * fr, termwise.
+        u128x qL  = load_line_mont_u128(tables_lo, tables_hi, len, 0, idx, half, x_mont);
+        u128x w1  = load_line_mont_u128(tables_lo, tables_hi, len, 1, idx, half, x_mont);
+        u128x qR  = load_line_mont_u128(tables_lo, tables_hi, len, 2, idx, half, x_mont);
+        u128x w2  = load_line_mont_u128(tables_lo, tables_hi, len, 3, idx, half, x_mont);
+        u128x qM  = load_line_mont_u128(tables_lo, tables_hi, len, 4, idx, half, x_mont);
+        u128x nqO = load_line_mont_u128(tables_lo, tables_hi, len, 5, idx, half, x_mont);
+        u128x w3  = load_line_mont_u128(tables_lo, tables_hi, len, 6, idx, half, x_mont);
+        u128x qC  = load_line_mont_u128(tables_lo, tables_hi, len, 7, idx, half, x_mont);
+        u128x fr  = load_line_mont_u128(tables_lo, tables_hi, len, 8, idx, half, x_mont);
+
+        acc = add_mod_u128(acc, prod3_spec_u128(qL, w1, fr));
+        acc = add_mod_u128(acc, prod3_spec_u128(qR, w2, fr));
+        acc = add_mod_u128(acc, prod4_spec_u128(qM, w1, w2, fr));
+        acc = add_mod_u128(acc, prod3_spec_u128(nqO, w3, fr));
+        acc = add_mod_u128(acc, prod2_spec_u128(qC, fr));
+        return acc;
+    }
+
+    if (poly_id == 2) {
+        // vanilla_perm:
+        // (pi - p1*p2 + alpha_phi*D1*D2*D3 - alpha*N1*N2*N3) * fr
+        // Signs/scalars are folded into input rows.
+        u128x pi   = load_line_mont_u128(tables_lo, tables_hi, len, 0, idx, half, x_mont);
+        u128x np1  = load_line_mont_u128(tables_lo, tables_hi, len, 1, idx, half, x_mont);
+        u128x p2   = load_line_mont_u128(tables_lo, tables_hi, len, 2, idx, half, x_mont);
+        u128x aphi = load_line_mont_u128(tables_lo, tables_hi, len, 3, idx, half, x_mont);
+        u128x D1   = load_line_mont_u128(tables_lo, tables_hi, len, 4, idx, half, x_mont);
+        u128x D2   = load_line_mont_u128(tables_lo, tables_hi, len, 5, idx, half, x_mont);
+        u128x D3   = load_line_mont_u128(tables_lo, tables_hi, len, 6, idx, half, x_mont);
+        u128x nN1  = load_line_mont_u128(tables_lo, tables_hi, len, 7, idx, half, x_mont);
+        u128x N2   = load_line_mont_u128(tables_lo, tables_hi, len, 8, idx, half, x_mont);
+        u128x N3   = load_line_mont_u128(tables_lo, tables_hi, len, 9, idx, half, x_mont);
+        u128x fr   = load_line_mont_u128(tables_lo, tables_hi, len, 10, idx, half, x_mont);
+
+        acc = add_mod_u128(acc, prod2_spec_u128(pi, fr));
+        acc = add_mod_u128(acc, prod3_spec_u128(np1, p2, fr));
+        acc = add_mod_u128(acc, prod5_spec_u128(aphi, D1, D2, D3, fr));
+        acc = add_mod_u128(acc, prod4_spec_u128(nN1, N2, N3, fr));
+        return acc;
+    }
+
+    if (poly_id == 3) {
+        // opencheck_6: y1*k1 + ... + y6*k6
+        #pragma unroll
+        for (int r = 0; r < 6; ++r) {
+            acc = add_mod_u128(
+                acc,
+                load_line_mont_u128(tables_lo, tables_hi, len, r, idx, half, x_mont)
+            );
+        }
+        return acc;
+    }
+
+    if (poly_id == 5 || poly_id == 6 || poly_id == 7) {
+        // degree_sweep:
+        // q1*w1 + q2*w2 + qH*w1^k*w2 + qC
+        u128x q1 = load_line_mont_u128(tables_lo, tables_hi, len, 0, idx, half, x_mont);
+        u128x w1 = load_line_mont_u128(tables_lo, tables_hi, len, 1, idx, half, x_mont);
+        u128x q2 = load_line_mont_u128(tables_lo, tables_hi, len, 2, idx, half, x_mont);
+        u128x w2 = load_line_mont_u128(tables_lo, tables_hi, len, 3, idx, half, x_mont);
+        u128x qH = load_line_mont_u128(tables_lo, tables_hi, len, 4, idx, half, x_mont);
+        u128x qC = load_line_mont_u128(tables_lo, tables_hi, len, 5, idx, half, x_mont);
+
+        acc = add_mod_u128(acc, prod2_spec_u128(q1, w1));
+        acc = add_mod_u128(acc, prod2_spec_u128(q2, w2));
+
+        if (poly_id == 5) {
+            acc = add_mod_u128(acc, prod3_spec_u128(qH, w1, w2));
+        } else if (poly_id == 6) {
+            acc = add_mod_u128(acc, prod5_spec_u128(qH, w1, w1, w1, w2));
+        } else {
+            acc = add_mod_u128(acc, prod7_spec_u128(qH, w1, w1, w1, w1, w1, w2));
+        }
+
+        acc = add_mod_u128(acc, qC);
+        return acc;
+    }
+
+    return {0ULL, 0ULL};
+}
+
+__global__ void eval_hyperplonk_sumcheck_u128_kernel(
+    const u64* __restrict__ tables_lo,
+    const u64* __restrict__ tables_hi,
+    int len,
+    int poly_id,
+    int degree,
+    u64* __restrict__ partials_lo,
+    u64* __restrict__ partials_hi) {
+
+    extern __shared__ u64 shared[];
+
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp_id = tid >> 5;
+    const int num_warps = (blockDim.x + 31) >> 5;
+    const int half = len >> 1;
+
+    u128x local[8];
+
+    #pragma unroll
+    for (int x = 0; x < 8; ++x) {
+        local[x] = {0ULL, 0ULL};
+    }
+
+    for (int i = blockIdx.x * blockDim.x + tid;
+         i < half;
+         i += blockDim.x * gridDim.x) {
+
+        for (int x = 0; x <= degree; ++x) {
+            u128x x_normal{static_cast<u64>(x), 0ULL};
+            u128x x_mont = to_mont(x_normal);
+
+            u128x y = eval_hyperplonk_poly_at_x_mont_u128(
+                tables_lo,
+                tables_hi,
+                len,
+                i,
+                half,
+                poly_id,
+                x_mont
+            );
+
+            local[x] = add_mod_u128(local[x], y);
+        }
+    }
+
+    for (int x = 0; x <= degree; ++x) {
+        u128x reduced = warp_reduce_add_mod_u128(local[x]);
+
+        if (lane == 0) {
+            int slot = (x * num_warps + warp_id) * 2;
+            shared[slot + 0] = reduced.lo;
+            shared[slot + 1] = reduced.hi;
+        }
+    }
+
+    __syncthreads();
+
+    if (warp_id == 0) {
+        for (int x = 0; x <= degree; ++x) {
+            u128x value{0ULL, 0ULL};
+
+            if (lane < num_warps) {
+                int slot = (x * num_warps + lane) * 2;
+                value.lo = shared[slot + 0];
+                value.hi = shared[slot + 1];
+            }
+
+            value = warp_reduce_add_mod_u128(value);
+
+            if (lane == 0) {
+                size_t out_idx =
+                    static_cast<size_t>(blockIdx.x) *
+                    static_cast<size_t>(degree + 1) +
+                    x;
+
+                partials_lo[out_idx] = value.lo;
+                partials_hi[out_idx] = value.hi;
+            }
+        }
+    }
+}
+
+} // namespace mont_u128_exp
+
+std::tuple<torch::Tensor, torch::Tensor> sumcheck_hyperplonk_full_mont_u128_cuda(
+    torch::Tensor eval_lo,
+    torch::Tensor eval_hi,
+    torch::Tensor challenges_lo,
+    torch::Tensor challenges_hi,
+    uint64_t modulus_hi,
+    uint64_t modulus_lo,
+    int64_t poly_id_64) {
+
+    using namespace mont_u128_exp;
+
+    if (modulus_hi != Q_HI || modulus_lo != Q_LO) {
+        throw std::invalid_argument("u128 specialized SumCheck currently requires q = 2^128 - 159");
+    }
+
+    int poly_id = static_cast<int>(poly_id_64);
+
+    if (poly_id == 4) {
+        throw std::invalid_argument("poly_id 4 is unused");
+    }
+
+    int degree = hp_spec::degree_for_poly(poly_id);
+    int rows = hp_spec::rows_for_poly(poly_id);
+
+    if (!eval_lo.is_cuda() || !eval_hi.is_cuda()) {
+        throw std::invalid_argument("eval_lo/eval_hi must be CUDA tensors");
+    }
+    if (eval_lo.scalar_type() != torch::kUInt64 ||
+        eval_hi.scalar_type() != torch::kUInt64) {
+        throw std::invalid_argument("eval_lo/eval_hi must be torch.uint64");
+    }
+    if (eval_lo.sizes() != eval_hi.sizes()) {
+        throw std::invalid_argument("eval_lo/eval_hi must have the same shape");
+    }
+    if (eval_lo.dim() != 2) {
+        throw std::invalid_argument("eval tensors must have shape (rows, N)");
+    }
+    if (eval_lo.size(0) < rows) {
+        throw std::invalid_argument("eval tensors have too few rows for requested poly_id");
+    }
+    if (!hp_spec::is_power_of_two_i64(eval_lo.size(1))) {
+        throw std::invalid_argument("N must be a power of two");
+    }
+
+    const c10::cuda::CUDAGuard device_guard(eval_lo.device());
+
+    auto normal_lo = eval_lo.narrow(0, 0, rows).contiguous();
+    auto normal_hi = eval_hi.narrow(0, 0, rows).contiguous();
+
+    auto ch_lo =
+        challenges_lo.to(eval_lo.options().dtype(torch::kUInt64)).contiguous();
+    auto ch_hi =
+        challenges_hi.to(eval_lo.options().dtype(torch::kUInt64)).contiguous();
+
+    int initial_len = static_cast<int>(normal_lo.size(1));
+    int rounds = hp_spec::log2_exact_i64(initial_len);
+
+    if (ch_lo.dim() != 1 || ch_hi.dim() != 1 ||
+        ch_lo.size(0) < rounds || ch_hi.size(0) < rounds) {
+        throw std::invalid_argument("challenge tensors must have shape at least (log2(N),)");
+    }
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    auto current_lo = torch::empty_like(normal_lo);
+    auto current_hi = torch::empty_like(normal_hi);
+    auto ch_mont_lo = torch::empty_like(ch_lo);
+    auto ch_mont_hi = torch::empty_like(ch_hi);
+
+    int conv_threads = SUMCHECK_THREADS;
+
+    int conv_blocks_tables = std::min(
+        SUMCHECK_MAX_BLOCKS,
+        static_cast<int>(
+            std::max<int64_t>(
+                1,
+                (normal_lo.numel() + conv_threads - 1) / conv_threads
+            )
+        )
+    );
+
+    int conv_blocks_chals = std::min(
+        SUMCHECK_MAX_BLOCKS,
+        static_cast<int>(
+            std::max<int64_t>(
+                1,
+                (ch_lo.numel() + conv_threads - 1) / conv_threads
+            )
+        )
+    );
+
+    convert_to_mont_u128_kernel<<<conv_blocks_tables, conv_threads, 0, stream>>>(
+        reinterpret_cast<const u64*>(normal_lo.data_ptr<uint64_t>()),
+        reinterpret_cast<const u64*>(normal_hi.data_ptr<uint64_t>()),
+        static_cast<size_t>(normal_lo.numel()),
+        reinterpret_cast<u64*>(current_lo.data_ptr<uint64_t>()),
+        reinterpret_cast<u64*>(current_hi.data_ptr<uint64_t>()));
+    hp_spec::check_last_cuda("u128 spec convert tables");
+
+    convert_to_mont_u128_kernel<<<conv_blocks_chals, conv_threads, 0, stream>>>(
+        reinterpret_cast<const u64*>(ch_lo.data_ptr<uint64_t>()),
+        reinterpret_cast<const u64*>(ch_hi.data_ptr<uint64_t>()),
+        static_cast<size_t>(ch_lo.numel()),
+        reinterpret_cast<u64*>(ch_mont_lo.data_ptr<uint64_t>()),
+        reinterpret_cast<u64*>(ch_mont_hi.data_ptr<uint64_t>()));
+    hp_spec::check_last_cuda("u128 spec convert challenges");
+
+    auto output_mont_lo =
+        torch::empty({rounds, degree + 1}, normal_lo.options());
+    auto output_mont_hi =
+        torch::empty({rounds, degree + 1}, normal_hi.options());
+
+    for (int round = 0; round < rounds; ++round) {
+        int len = static_cast<int>(current_lo.size(1));
+        int half = len >> 1;
+
+        int blocks = std::min(
+            SUMCHECK_MAX_BLOCKS,
+            std::max(1, (half + SUMCHECK_THREADS - 1) / SUMCHECK_THREADS)
+        );
+
+        auto partials_lo =
+            torch::empty({blocks, degree + 1}, normal_lo.options());
+        auto partials_hi =
+            torch::empty({blocks, degree + 1}, normal_hi.options());
+
+        size_t shmem =
+            static_cast<size_t>(degree + 1) *
+            SUMCHECK_THREADS *
+            2 *
+            sizeof(u64);
+
+        eval_hyperplonk_sumcheck_u128_kernel<<<blocks, SUMCHECK_THREADS, shmem, stream>>>(
+            reinterpret_cast<const u64*>(current_lo.data_ptr<uint64_t>()),
+            reinterpret_cast<const u64*>(current_hi.data_ptr<uint64_t>()),
+            len,
+            poly_id,
+            degree,
+            reinterpret_cast<u64*>(partials_lo.data_ptr<uint64_t>()),
+            reinterpret_cast<u64*>(partials_hi.data_ptr<uint64_t>()));
+        hp_spec::check_last_cuda("u128 spec eval");
+
+        reduce_sumcheck_u128_kernel<<<degree + 1, SUMCHECK_THREADS, 0, stream>>>(
+            reinterpret_cast<const u64*>(partials_lo.data_ptr<uint64_t>()),
+            reinterpret_cast<const u64*>(partials_hi.data_ptr<uint64_t>()),
+            blocks,
+            degree,
+            reinterpret_cast<u64*>(output_mont_lo[round].data_ptr<uint64_t>()),
+            reinterpret_cast<u64*>(output_mont_hi[round].data_ptr<uint64_t>()));
+        hp_spec::check_last_cuda("u128 spec reduce");
+
+        if (round + 1 < rounds) {
+            auto next_lo = torch::empty({rows, half}, normal_lo.options());
+            auto next_hi = torch::empty({rows, half}, normal_hi.options());
+
+            int upd_blocks = std::min(
+                SUMCHECK_MAX_BLOCKS,
+                std::max(
+                    1,
+                    (rows * half + SUMCHECK_THREADS - 1) / SUMCHECK_THREADS
+                )
+            );
+
+            update_sumcheck_u128_kernel<<<upd_blocks, SUMCHECK_THREADS, 0, stream>>>(
+                reinterpret_cast<const u64*>(current_lo.data_ptr<uint64_t>()),
+                reinterpret_cast<const u64*>(current_hi.data_ptr<uint64_t>()),
+                rows,
+                len,
+                reinterpret_cast<const u64*>(ch_mont_lo.data_ptr<uint64_t>()),
+                reinterpret_cast<const u64*>(ch_mont_hi.data_ptr<uint64_t>()),
+                round,
+                reinterpret_cast<u64*>(next_lo.data_ptr<uint64_t>()),
+                reinterpret_cast<u64*>(next_hi.data_ptr<uint64_t>()));
+            hp_spec::check_last_cuda("u128 spec update");
+
+            current_lo = next_lo;
+            current_hi = next_hi;
+        }
+    }
+
+    auto output_lo = torch::empty_like(output_mont_lo);
+    auto output_hi = torch::empty_like(output_mont_hi);
+
+    int conv_blocks_out = std::min(
+        SUMCHECK_MAX_BLOCKS,
+        static_cast<int>(
+            std::max<int64_t>(
+                1,
+                (output_mont_lo.numel() + conv_threads - 1) / conv_threads
+            )
+        )
+    );
+
+    convert_from_mont_u128_kernel<<<conv_blocks_out, conv_threads, 0, stream>>>(
+        reinterpret_cast<const u64*>(output_mont_lo.data_ptr<uint64_t>()),
+        reinterpret_cast<const u64*>(output_mont_hi.data_ptr<uint64_t>()),
+        static_cast<size_t>(output_mont_lo.numel()),
+        reinterpret_cast<u64*>(output_lo.data_ptr<uint64_t>()),
+        reinterpret_cast<u64*>(output_hi.data_ptr<uint64_t>()));
+    hp_spec::check_last_cuda("u128 spec convert output");
+
+    return std::make_tuple(output_lo, output_hi);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("sumcheck_hyperplonk_full_mont_u128_cuda",
+          &sumcheck_hyperplonk_full_mont_u128_cuda,
+          "Specialized full Montgomery-domain u128 SumCheck");
+
     m.def("sumcheck_terms_full_mont_u128_cuda",
           &sumcheck_terms_full_mont_u128_cuda,
           "Generic full Montgomery-domain u128 SumCheck");

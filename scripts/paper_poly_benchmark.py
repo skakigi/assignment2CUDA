@@ -127,7 +127,7 @@ def bench_poly(name, terms, num_vars, warmup, runs, seed):
     term_vars = torch.tensor(flat, dtype=torch.int32)
 
     def fn():
-        claim0, out = sumcheck_cuda_ext.sumcheck_terms_u32_cuda(
+        claim0, out = sumcheck_cuda_ext.sumcheck_terms_full_mont_u32_cuda(
             tables,
             chals,
             term_offsets,

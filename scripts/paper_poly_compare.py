@@ -163,7 +163,7 @@ def build_generic_call(tables, chals, terms):
     term_vars = torch.tensor(flat, dtype=torch.int32)
 
     def fn():
-        _claim0, out = sumcheck_cuda_ext.sumcheck_terms_u32_cuda(
+        _claim0, out = sumcheck_cuda_ext.sumcheck_terms_full_mont_u32_cuda(
             tables, chals, term_offsets, term_vars, Q32
         )
         return out
@@ -175,7 +175,7 @@ def build_specialized_call(tables, chals, poly_name):
     poly_id = POLY_IDS[poly_name]
 
     def fn():
-        return sumcheck_cuda_ext.sumcheck_hyperplonk_u32_cuda(
+        return sumcheck_cuda_ext.sumcheck_hyperplonk_full_mont_u32_cuda(
             tables, chals, Q32, poly_id
         )
 
@@ -222,9 +222,18 @@ def main():
     else:
         poly_names = [x.strip() for x in args.polys.split(",") if x.strip()]
 
+    required = [
+        "sumcheck_terms_full_mont_u32_cuda",
+        "sumcheck_hyperplonk_full_mont_u32_cuda",
+    ]
+    missing = [name for name in required if not hasattr(sumcheck_cuda_ext, name)]
+    if missing:
+        raise RuntimeError(f"Missing required full Montgomery entrypoints: {missing}")
+
     print("device:", torch.cuda.get_device_name())
     print("SC_EVAL_VARIANT:", os.environ.get("SC_EVAL_VARIANT", "unset/default"))
     print("backend funcs:", [x for x in dir(sumcheck_cuda_ext) if "sumcheck" in x])
+    print("active backend: full Montgomery domain")
     print()
 
     headers = [

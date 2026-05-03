@@ -135,33 +135,144 @@ struct DeviceBuffer {
     }
 };
 
-enum class EvalKernelVariant {
+enum class SpecEvalStrategy {
     kBaselineShared = 0,
     kMleTiledShared = 1,
     kMleTiledWarp = 2,
     kMleTiledReduceIntrinsics = 3,
+    kCompiledTemplate
 };
 
-EvalKernelVariant select_eval_variant() {
+// Known fixed-template polynomial IDs used by HyperPlonk-style benchmarks.
+// Keep these IDs stable because Python benchmark scripts pass them through.
+enum PolyTemplateId : int {
+    kPolyVanillaGate = 0,
+    kPolyVanillaZero = 1,
+    kPolyVanillaPerm = 2,
+    kPolyOpencheck6 = 3,
+
+    kPolyDegreeSweepDeg3 = 5,
+    kPolyDegreeSweepDeg5 = 6,
+    kPolyDegreeSweepDeg7 = 7,
+
+    kPolyBaselineLinear = 8,
+    kPolyBaselineMul = 9,
+    kPolyBaselineMulAdd = 10,
+    kPolyBaselineCubicProduct = 11,
+
+    kPolyAdvancedA2B2C = 12,
+    kPolyAdvancedAbcPlusDe = 13,
+    kPolyAdvancedAbcgPlusDeg = 14,
+};
+
+struct PolyTemplateMeta {
+    int degree;
+    int rows;
+    const char* name;
+};
+
+inline PolyTemplateMeta meta_for_poly(int poly_id) {
+    switch (poly_id) {
+        case kPolyVanillaGate:
+            return {3, 8, "vanilla_gate"};
+        case kPolyVanillaZero:
+            return {4, 9, "vanilla_zero"};
+        case kPolyVanillaPerm:
+            return {5, 11, "vanilla_perm"};
+        case kPolyOpencheck6:
+            return {1, 6, "opencheck_6"};
+
+        case kPolyDegreeSweepDeg3:
+            return {3, 6, "degree_sweep_deg3"};
+        case kPolyDegreeSweepDeg5:
+            return {5, 6, "degree_sweep_deg5"};
+        case kPolyDegreeSweepDeg7:
+            return {7, 6, "degree_sweep_deg7"};
+
+        case kPolyBaselineLinear:
+            return {1, 1, "baseline_linear"};
+        case kPolyBaselineMul:
+            return {2, 2, "baseline_mul"};
+        case kPolyBaselineMulAdd:
+            return {2, 3, "baseline_mul_add"};
+        case kPolyBaselineCubicProduct:
+            return {3, 3, "baseline_cubic_product"};
+
+        case kPolyAdvancedA2B2C:
+            return {5, 3, "advanced_a2b2c"};
+        case kPolyAdvancedAbcPlusDe:
+            return {3, 5, "advanced_abc_plus_de"};
+        case kPolyAdvancedAbcgPlusDeg:
+            return {4, 6, "advanced_abcg_plus_deg"};
+
+        default:
+            TORCH_CHECK(false, "unsupported fixed-template poly_id: ", poly_id);
+    }
+
+    return {-1, -1, "unsupported"};
+}
+
+
+
+
+
+SpecEvalStrategy select_spec_eval_strategy() {
     const char* env = std::getenv("SC_EVAL_VARIANT");
     if (env == nullptr) {
-        return EvalKernelVariant::kBaselineShared;
+        return SpecEvalStrategy::kBaselineShared;
     }
     const std::string value(env);
     if (value == "baseline" || value == "shared") {
-        return EvalKernelVariant::kBaselineShared;
+        return SpecEvalStrategy::kBaselineShared;
     }
     if (value == "mle_tiled" || value == "mle_tiled_shared" || value == "tile") {
-        return EvalKernelVariant::kMleTiledShared;
+        return SpecEvalStrategy::kMleTiledShared;
     }
     if (value == "mle_tiled_warp" || value == "warp" || value == "shuffle") {
-        return EvalKernelVariant::kMleTiledWarp;
+        return SpecEvalStrategy::kMleTiledWarp;
     }
     if (value == "mle_tiled_reduce" || value == "reduce" || value == "intrinsics") {
-        return EvalKernelVariant::kMleTiledReduceIntrinsics;
+        return SpecEvalStrategy::kMleTiledReduceIntrinsics;
     }
-    return EvalKernelVariant::kBaselineShared;
+    
+    if (value == "compiled" || value == "compile" ||
+        value == "templated" || value == "template") {
+        return SpecEvalStrategy::kCompiledTemplate;
+    }
+    return SpecEvalStrategy::kBaselineShared;
 }
+
+inline bool supports_compiled_template_for_poly(int poly_id) {
+    // Compiled-template kernels are enabled one polynomial at a time.
+    // This intentionally returns false until a compiled kernel is added.
+    (void)poly_id;
+    return false;
+}
+
+inline SpecEvalStrategy resolve_spec_eval_strategy_for_launch(
+    SpecEvalStrategy selected,
+    int poly_id) {
+    // `compiled` is now a first-class strategy, but it only routes to
+    // compiled kernels for templates explicitly marked as supported.
+    if (selected == SpecEvalStrategy::kCompiledTemplate &&
+        !supports_compiled_template_for_poly(poly_id)) {
+        return SpecEvalStrategy::kBaselineShared;
+    }
+    return selected;
+}
+
+inline SpecEvalStrategy resolve_spec_eval_strategy_for_launch_no_poly(
+    SpecEvalStrategy selected) {
+    // Generic/non-fixed-template paths do not have a fixed poly_id.
+    // Treat compiled as baseline until compiled support is only used by
+    // fixed-template dispatch.
+    if (selected == SpecEvalStrategy::kCompiledTemplate) {
+        return SpecEvalStrategy::kBaselineShared;
+    }
+    return selected;
+}
+
+
 
 inline uint64_t make_barrett_mu_u32_host(uint32_t q) {
     if (q <= 1U) {
@@ -234,30 +345,30 @@ __device__ __forceinline__ uint32_t mle_update_u32_dev(
 constexpr int kEvalTStride = 4;
 constexpr int kMleItemsPerThread = 4;
 
-inline int eval_threads_for_variant(EvalKernelVariant variant) {
-    return (variant == EvalKernelVariant::kBaselineShared) ? 256 : 128;
+inline int eval_threads_for_strategy(SpecEvalStrategy variant) {
+    return (variant == SpecEvalStrategy::kBaselineShared) ? 256 : 128;
 }
 
-inline uint64_t eval_items_per_block(EvalKernelVariant variant, int eval_threads) {
-    if (variant == EvalKernelVariant::kBaselineShared) {
+inline uint64_t eval_items_per_block_for_strategy(SpecEvalStrategy variant, int eval_threads) {
+    if (variant == SpecEvalStrategy::kBaselineShared) {
         return static_cast<uint64_t>(eval_threads);
     }
     return static_cast<uint64_t>(eval_threads) * static_cast<uint64_t>(kMleItemsPerThread);
 }
 
 inline size_t eval_shared_bytes_for_variant(
-    EvalKernelVariant variant,
+    SpecEvalStrategy variant,
     int eval_threads,
     int32_t n_terms,
     int32_t total_term_vars) {
     const size_t metadata_bytes = static_cast<size_t>(n_terms + 1 + total_term_vars) * sizeof(int32_t);
-    if (variant == EvalKernelVariant::kBaselineShared ||
-        variant == EvalKernelVariant::kMleTiledShared) {
+    if (variant == SpecEvalStrategy::kBaselineShared ||
+        variant == SpecEvalStrategy::kMleTiledShared) {
         return static_cast<size_t>(kEvalTStride) * static_cast<size_t>(eval_threads) * sizeof(uint32_t) +
                metadata_bytes;
     }
     const size_t warp_count = static_cast<size_t>((eval_threads + 31) / 32);
-    if (variant == EvalKernelVariant::kMleTiledWarp) {
+    if (variant == SpecEvalStrategy::kMleTiledWarp) {
         return static_cast<size_t>(kEvalTStride) * warp_count * sizeof(uint32_t) + metadata_bytes;
     }
     return static_cast<size_t>(kEvalTStride) * warp_count * sizeof(uint64_t) + metadata_bytes;
@@ -961,9 +1072,11 @@ int gpu_sumcheck_u32(
     const int32_t total_term_vars = term_offsets[n_terms];
     const int32_t t_count = max_degree + 1;
     const uint64_t q_recip = make_barrett_mu_u32_host(q);
-    const EvalKernelVariant eval_variant = select_eval_variant();
-    const int eval_threads = eval_threads_for_variant(eval_variant);
-    const uint64_t eval_block_items = eval_items_per_block(eval_variant, eval_threads);
+    const SpecEvalStrategy selected_eval_strategy = select_spec_eval_strategy();
+    const SpecEvalStrategy eval_strategy =
+        resolve_spec_eval_strategy_for_launch_no_poly(selected_eval_strategy);
+    const int eval_threads = eval_threads_for_strategy(eval_strategy);
+    const uint64_t eval_block_items = eval_items_per_block_for_strategy(eval_strategy, eval_threads);
     const int reduce_threads = 256;
 
     std::vector<DeviceBuffer<uint32_t>> d_tables(static_cast<size_t>(n_inputs));
@@ -1043,13 +1156,13 @@ int gpu_sumcheck_u32(
                                  static_cast<unsigned int>(t_tiles),
                                  1U);
             const size_t eval_shared_bytes = eval_shared_bytes_for_variant(
-                eval_variant,
+                eval_strategy,
                 eval_threads,
                 n_terms,
                 total_term_vars);
 
-            switch (eval_variant) {
-                case EvalKernelVariant::kBaselineShared:
+            switch (eval_strategy) {
+                case SpecEvalStrategy::kBaselineShared:
                     eval_round_sums_u32_kernel<<<eval_grid, eval_threads, eval_shared_bytes>>>(
                         reinterpret_cast<const uint32_t* const*>(d_table_ptrs.get()),
                         n_inputs,
@@ -1066,7 +1179,7 @@ int gpu_sumcheck_u32(
                         return 1;
                     }
                     break;
-                case EvalKernelVariant::kMleTiledShared:
+                case SpecEvalStrategy::kMleTiledShared:
                     eval_round_sums_u32_mle_tiled_kernel<false><<<eval_grid, eval_threads, eval_shared_bytes>>>(
                         reinterpret_cast<const uint32_t* const*>(d_table_ptrs.get()),
                         n_inputs,
@@ -1083,7 +1196,7 @@ int gpu_sumcheck_u32(
                         return 1;
                     }
                     break;
-                case EvalKernelVariant::kMleTiledWarp:
+                case SpecEvalStrategy::kMleTiledWarp:
                     eval_round_sums_u32_mle_tiled_kernel<true><<<eval_grid, eval_threads, eval_shared_bytes>>>(
                         reinterpret_cast<const uint32_t* const*>(d_table_ptrs.get()),
                         n_inputs,
@@ -1100,7 +1213,7 @@ int gpu_sumcheck_u32(
                         return 1;
                     }
                     break;
-                case EvalKernelVariant::kMleTiledReduceIntrinsics:
+                case SpecEvalStrategy::kMleTiledReduceIntrinsics:
                     eval_round_sums_u32_mle_tiled_reduce_intrinsics_kernel<<<eval_grid, eval_threads, eval_shared_bytes>>>(
                         reinterpret_cast<const uint32_t* const*>(d_table_ptrs.get()),
                         n_inputs,
@@ -1128,7 +1241,7 @@ int gpu_sumcheck_u32(
                 const dim3 reduce_grid(static_cast<unsigned int>(reduce_blocks),
                                        static_cast<unsigned int>(t_count),
                                        1U);
-                if (eval_variant == EvalKernelVariant::kMleTiledReduceIntrinsics) {
+                if (eval_strategy == SpecEvalStrategy::kMleTiledReduceIntrinsics) {
                     const size_t reduce_shared_bytes =
                         static_cast<size_t>((reduce_threads + 31) / 32) * sizeof(uint64_t);
                     reduce_rows_u32_intrinsics_kernel<<<reduce_grid, reduce_threads, reduce_shared_bytes>>>(
@@ -1322,9 +1435,11 @@ std::tuple<torch::Tensor, torch::Tensor> torch_sumcheck_terms_u32_cuda(
     auto d_term_vars_t = term_vars_cpu.to(eval_tables.device(), torch::kInt32, false, true);
 
     const uint64_t q_recip = make_barrett_mu_u32_host(q);
-    const EvalKernelVariant eval_variant = select_eval_variant();
-    const int eval_threads = eval_threads_for_variant(eval_variant);
-    const uint64_t eval_block_items = eval_items_per_block(eval_variant, eval_threads);
+    const SpecEvalStrategy selected_eval_strategy = select_spec_eval_strategy();
+    const SpecEvalStrategy eval_strategy =
+        resolve_spec_eval_strategy_for_launch_no_poly(selected_eval_strategy);
+    const int eval_threads = eval_threads_for_strategy(eval_strategy);
+    const uint64_t eval_block_items = eval_items_per_block_for_strategy(eval_strategy, eval_threads);
     const int reduce_threads = 256;
 
     uint64_t current_len = n;
@@ -1333,15 +1448,15 @@ std::tuple<torch::Tensor, torch::Tensor> torch_sumcheck_terms_u32_cuda(
         const int blocks_eval = static_cast<int>((half + eval_block_items - 1ULL) / eval_block_items);
         const int t_tiles = (t_count + kEvalTStride - 1) / kEvalTStride;
         const dim3 eval_grid(static_cast<unsigned int>(blocks_eval), static_cast<unsigned int>(t_tiles), 1U);
-        const size_t eval_shared_bytes = eval_shared_bytes_for_variant(eval_variant, eval_threads, n_terms, total_term_vars);
+        const size_t eval_shared_bytes = eval_shared_bytes_for_variant(eval_strategy, eval_threads, n_terms, total_term_vars);
 
         auto d_block_sums_a = torch::empty({t_count, blocks_eval}, options);
         auto d_block_sums_b = torch::empty({t_count, blocks_eval}, options);
         uint32_t* a_ptr = reinterpret_cast<uint32_t*>(d_block_sums_a.data_ptr());
         uint32_t* b_ptr = reinterpret_cast<uint32_t*>(d_block_sums_b.data_ptr());
 
-        switch (eval_variant) {
-            case EvalKernelVariant::kBaselineShared:
+        switch (eval_strategy) {
+            case SpecEvalStrategy::kBaselineShared:
                 eval_round_sums_u32_kernel<<<eval_grid, eval_threads, eval_shared_bytes, stream>>>(
                     reinterpret_cast<const uint32_t* const*>(d_table_ptrs.get()),
                     n_inputs,
@@ -1355,7 +1470,7 @@ std::tuple<torch::Tensor, torch::Tensor> torch_sumcheck_terms_u32_cuda(
                     q_recip,
                     a_ptr);
                 break;
-            case EvalKernelVariant::kMleTiledShared:
+            case SpecEvalStrategy::kMleTiledShared:
                 eval_round_sums_u32_mle_tiled_kernel<false><<<eval_grid, eval_threads, eval_shared_bytes, stream>>>(
                     reinterpret_cast<const uint32_t* const*>(d_table_ptrs.get()),
                     n_inputs,
@@ -1369,7 +1484,7 @@ std::tuple<torch::Tensor, torch::Tensor> torch_sumcheck_terms_u32_cuda(
                     q_recip,
                     a_ptr);
                 break;
-            case EvalKernelVariant::kMleTiledWarp:
+            case SpecEvalStrategy::kMleTiledWarp:
                 eval_round_sums_u32_mle_tiled_kernel<true><<<eval_grid, eval_threads, eval_shared_bytes, stream>>>(
                     reinterpret_cast<const uint32_t* const*>(d_table_ptrs.get()),
                     n_inputs,
@@ -1383,7 +1498,7 @@ std::tuple<torch::Tensor, torch::Tensor> torch_sumcheck_terms_u32_cuda(
                     q_recip,
                     a_ptr);
                 break;
-            case EvalKernelVariant::kMleTiledReduceIntrinsics:
+            case SpecEvalStrategy::kMleTiledReduceIntrinsics:
                 eval_round_sums_u32_mle_tiled_reduce_intrinsics_kernel<<<eval_grid, eval_threads, eval_shared_bytes, stream>>>(
                     reinterpret_cast<const uint32_t* const*>(d_table_ptrs.get()),
                     n_inputs,
@@ -1408,7 +1523,7 @@ std::tuple<torch::Tensor, torch::Tensor> torch_sumcheck_terms_u32_cuda(
         while (reduce_width > 1ULL) {
             const int reduce_blocks = static_cast<int>((reduce_width + static_cast<uint64_t>(reduce_threads) - 1ULL) / static_cast<uint64_t>(reduce_threads));
             const dim3 reduce_grid(static_cast<unsigned int>(reduce_blocks), static_cast<unsigned int>(t_count), 1U);
-            if (eval_variant == EvalKernelVariant::kMleTiledReduceIntrinsics) {
+            if (eval_strategy == SpecEvalStrategy::kMleTiledReduceIntrinsics) {
                 const size_t reduce_shared_bytes = static_cast<size_t>((reduce_threads + 31) / 32) * sizeof(uint64_t);
                 reduce_rows_u32_intrinsics_kernel<<<reduce_grid, reduce_threads, reduce_shared_bytes, stream>>>(
                     reduce_in, reduce_out, reduce_width, t_count, q);
@@ -1594,7 +1709,7 @@ __device__ __forceinline__ u32 eval_poly_at_x(
 
     u32 acc = 0;
 
-    if (poly_id == 0) {
+    if (poly_id == kPolyVanillaGate) {
         // vanilla_gate:
         // qL*w1 + qR*w2 + qM*w1*w2 + neg_qO*w3 + qC
         u32 qL = load_line(tables, len, 0, idx, half, x, q);
@@ -1614,7 +1729,7 @@ __device__ __forceinline__ u32 eval_poly_at_x(
         return acc;
     }
 
-    if (poly_id == 1) {
+    if (poly_id == kPolyVanillaZero) {
         // vanilla_zero = vanilla_gate * fr, termwise.
         u32 qL = load_line(tables, len, 0, idx, half, x, q);
         u32 w1 = load_line(tables, len, 1, idx, half, x, q);
@@ -1634,7 +1749,7 @@ __device__ __forceinline__ u32 eval_poly_at_x(
         return acc;
     }
 
-    if (poly_id == 2) {
+    if (poly_id == kPolyVanillaPerm) {
         // vanilla_perm:
         // (pi - p1*p2 + alpha*phi*D1*D2*D3 - alpha*N1*N2*N3) * fr
         // Signs/scalars are folded into rows.
@@ -1657,7 +1772,7 @@ __device__ __forceinline__ u32 eval_poly_at_x(
         return acc;
     }
 
-    if (poly_id == 3) {
+    if (poly_id == kPolyOpencheck6) {
         // opencheck_6: y1*k1 + ... + y6*k6, coefficients folded into rows.
         #pragma unroll
         for (int r = 0; r < 6; ++r) {
@@ -1666,65 +1781,21 @@ __device__ __forceinline__ u32 eval_poly_at_x(
         return acc;
     }
 
-    if (poly_id == 4) {
-        // jellyfish_zero structural template.
-        u32 q1 = load_line(tables, len, 0, idx, half, x, q);
-        u32 w1 = load_line(tables, len, 1, idx, half, x, q);
-        u32 q2 = load_line(tables, len, 2, idx, half, x, q);
-        u32 w2 = load_line(tables, len, 3, idx, half, x, q);
-        u32 q3 = load_line(tables, len, 4, idx, half, x, q);
-        u32 w3 = load_line(tables, len, 5, idx, half, x, q);
-        u32 q4 = load_line(tables, len, 6, idx, half, x, q);
-        u32 w4 = load_line(tables, len, 7, idx, half, x, q);
-        u32 qM1 = load_line(tables, len, 8, idx, half, x, q);
-        u32 qM2 = load_line(tables, len, 9, idx, half, x, q);
-        u32 qH1 = load_line(tables, len, 10, idx, half, x, q);
-        u32 qH2 = load_line(tables, len, 11, idx, half, x, q);
-        u32 qH3 = load_line(tables, len, 12, idx, half, x, q);
-        u32 qH4 = load_line(tables, len, 13, idx, half, x, q);
-        u32 nqO = load_line(tables, len, 14, idx, half, x, q);
-        u32 w5 = load_line(tables, len, 15, idx, half, x, q);
-        u32 qECC = load_line(tables, len, 16, idx, half, x, q);
-        u32 fr = load_line(tables, len, 17, idx, half, x, q);
-        u32 qC = load_line(tables, len, 18, idx, half, x, q);
 
-        acc = add_mod(acc, prod3(q1, w1, fr, q), q);
-        acc = add_mod(acc, prod3(q2, w2, fr, q), q);
-        acc = add_mod(acc, prod3(q3, w3, fr, q), q);
-        acc = add_mod(acc, prod3(q4, w4, fr, q), q);
-        acc = add_mod(acc, prod4(qM1, w1, w2, fr, q), q);
-        acc = add_mod(acc, prod4(qM2, w3, w4, fr, q), q);
-
-        u32 w1_5 = prod5(w1, w1, w1, w1, w1, q);
-        u32 w2_5 = prod5(w2, w2, w2, w2, w2, q);
-        u32 w3_5 = prod5(w3, w3, w3, w3, w3, q);
-        u32 w4_5 = prod5(w4, w4, w4, w4, w4, q);
-
-        acc = add_mod(acc, prod3(qH1, w1_5, fr, q), q);
-        acc = add_mod(acc, prod3(qH2, w2_5, fr, q), q);
-        acc = add_mod(acc, prod3(qH3, w3_5, fr, q), q);
-        acc = add_mod(acc, prod3(qH4, w4_5, fr, q), q);
-        acc = add_mod(acc, prod3(nqO, w5, fr, q), q);
-        acc = add_mod(acc, prod6(qECC, w1, w2, w3, w4, fr, q), q);
-        acc = add_mod(acc, prod2(qC, fr, q), q);
-
-        return acc;
-    }
-
-    if (poly_id == 8) {
+    if (poly_id == kPolyBaselineLinear) {
         // baseline_linear: a
         u32 a = load_line(tables, len, 0, idx, half, x, q);
         return a;
     }
 
-    if (poly_id == 9) {
+    if (poly_id == kPolyBaselineMul) {
         // baseline_mul: a*b
         u32 a = load_line(tables, len, 0, idx, half, x, q);
         u32 b = load_line(tables, len, 1, idx, half, x, q);
         return prod2(a, b, q);
     }
 
-    if (poly_id == 10) {
+    if (poly_id == kPolyBaselineMulAdd) {
         // baseline_mul_add: a*b + c
         u32 a = load_line(tables, len, 0, idx, half, x, q);
         u32 b = load_line(tables, len, 1, idx, half, x, q);
@@ -1732,7 +1803,7 @@ __device__ __forceinline__ u32 eval_poly_at_x(
         return add_mod(prod2(a, b, q), c, q);
     }
 
-    if (poly_id == 11) {
+    if (poly_id == kPolyBaselineCubicProduct) {
         // baseline_cubic_product: a*b*c
         u32 a = load_line(tables, len, 0, idx, half, x, q);
         u32 b = load_line(tables, len, 1, idx, half, x, q);
@@ -1741,7 +1812,7 @@ __device__ __forceinline__ u32 eval_poly_at_x(
     }
 
 
-    if (poly_id == 12) {
+    if (poly_id == kPolyAdvancedA2B2C) {
         // advanced_a2b2c old hp_spec: a*a*b*b*c
         u32 a = load_line(tables, len, 0, idx, half, x, q);
         u32 b = load_line(tables, len, 1, idx, half, x, q);
@@ -1749,7 +1820,7 @@ __device__ __forceinline__ u32 eval_poly_at_x(
         return prod5(a, a, b, b, c, q);
     }
 
-    if (poly_id == 13) {
+    if (poly_id == kPolyAdvancedAbcPlusDe) {
         // advanced_abc_plus_de old hp_spec: a*b*c + d*e
         u32 a = load_line(tables, len, 0, idx, half, x, q);
         u32 b = load_line(tables, len, 1, idx, half, x, q);
@@ -1759,7 +1830,7 @@ __device__ __forceinline__ u32 eval_poly_at_x(
         return add_mod(prod3(a, b, c, q), prod2(d, e, q), q);
     }
 
-    if (poly_id == 14) {
+    if (poly_id == kPolyAdvancedAbcgPlusDeg) {
         // advanced_abcg_plus_deg old hp_spec: a*b*c*g + d*e*g
         u32 a = load_line(tables, len, 0, idx, half, x, q);
         u32 b = load_line(tables, len, 1, idx, half, x, q);
@@ -1770,7 +1841,9 @@ __device__ __forceinline__ u32 eval_poly_at_x(
         return add_mod(prod4(a, b, c, g, q), prod3(d, e, g, q), q);
     }
 
-    if (poly_id == 5 || poly_id == 6 || poly_id == 7) {
+    if (poly_id == kPolyDegreeSweepDeg3 ||
+        poly_id == kPolyDegreeSweepDeg5 ||
+        poly_id == kPolyDegreeSweepDeg7) {
         // custom gate family:
         //   q1*w1 + q2*w2 + qH*w1^k*w2 + qC
         //
@@ -1787,9 +1860,9 @@ __device__ __forceinline__ u32 eval_poly_at_x(
         acc = add_mod(acc, prod2(q1, w1, q), q);
         acc = add_mod(acc, prod2(q2, w2, q), q);
 
-        if (poly_id == 5) {
+        if (poly_id == kPolyDegreeSweepDeg3) {
             acc = add_mod(acc, prod3(qH, w1, w2, q), q);
-        } else if (poly_id == 6) {
+        } else if (poly_id == kPolyDegreeSweepDeg5) {
             acc = add_mod(acc, prod5(qH, w1, w1, w1, w2, q), q);
         } else {
             acc = add_mod(acc, prod7(qH, w1, w1, w1, w1, w1, w2, q), q);
@@ -1949,45 +2022,11 @@ __global__ void update_kernel(
 }
 
 int degree_for_poly(int poly_id) {
-    switch (poly_id) {
-        case 0: return 3; // vanilla_gate
-        case 1: return 4; // vanilla_zero
-        case 2: return 5; // vanilla_perm
-        case 3: return 1; // opencheck_6
-        case 4: return 7; // jellyfish_zero
-        case 5: return 3; // custom_gate_deg3
-        case 6: return 5; // custom_gate_deg5
-        case 7: return 7; // custom_gate_deg7
-        case 8: return 1; // baseline_linear: a
-        case 9: return 2; // baseline_mul: a*b
-        case 10: return 2; // baseline_mul_add: a*b+c
-        case 11: return 3; // baseline_cubic_product: a*b*c
-        case 12: return 5; // advanced_a2b2c
-        case 13: return 3; // advanced_abc_plus_de
-        case 14: return 4; // advanced_abcg_plus_deg
-        default: throw std::invalid_argument("unknown HyperPlonk poly_id");
-    }
+    return meta_for_poly(poly_id).degree;
 }
 
 int rows_for_poly(int poly_id) {
-    switch (poly_id) {
-        case 0: return 8;
-        case 1: return 9;
-        case 2: return 11;
-        case 3: return 6;
-        case 4: return 19;
-        case 5: return 6;
-        case 6: return 6;
-        case 7: return 6;
-        case 8: return 1;
-        case 9: return 2;
-        case 10: return 3;
-        case 11: return 3;
-        case 12: return 3; // advanced_a2b2c rows
-        case 13: return 5; // advanced_abc_plus_de rows
-        case 14: return 6; // advanced_abcg_plus_deg rows
-        default: throw std::invalid_argument("unknown HyperPlonk poly_id");
-    }
+    return meta_for_poly(poly_id).rows;
 }
 
 bool is_power_of_two_i64(int64_t x) {
@@ -2199,24 +2238,24 @@ __device__ __forceinline__ u32 eval_poly_at_x_mont(
 
     u32 acc = 0;
 
-    if (poly_id == 8) {
+    if (poly_id == kPolyBaselineLinear) {
         return load_line_mont(tables, len, 0, idx, half, x_mont, q);
     }
 
-    if (poly_id == 9) {
+    if (poly_id == kPolyBaselineMul) {
         u32 a = load_line_mont(tables, len, 0, idx, half, x_mont, q);
         u32 b = load_line_mont(tables, len, 1, idx, half, x_mont, q);
         return prod2(a, b);
     }
 
-    if (poly_id == 10) {
+    if (poly_id == kPolyBaselineMulAdd) {
         u32 a = load_line_mont(tables, len, 0, idx, half, x_mont, q);
         u32 b = load_line_mont(tables, len, 1, idx, half, x_mont, q);
         u32 c = load_line_mont(tables, len, 2, idx, half, x_mont, q);
         return add_mod(prod2(a, b), c, q);
     }
 
-    if (poly_id == 11) {
+    if (poly_id == kPolyBaselineCubicProduct) {
         u32 a = load_line_mont(tables, len, 0, idx, half, x_mont, q);
         u32 b = load_line_mont(tables, len, 1, idx, half, x_mont, q);
         u32 c = load_line_mont(tables, len, 2, idx, half, x_mont, q);
@@ -2224,7 +2263,7 @@ __device__ __forceinline__ u32 eval_poly_at_x_mont(
     }
 
 
-    if (poly_id == 12) {
+    if (poly_id == kPolyAdvancedA2B2C) {
         // advanced_a2b2c u32 full mont: a*a*b*b*c
         u32 a = load_line_mont(tables, len, 0, idx, half, x_mont, q);
         u32 b = load_line_mont(tables, len, 1, idx, half, x_mont, q);
@@ -2232,7 +2271,7 @@ __device__ __forceinline__ u32 eval_poly_at_x_mont(
         return prod5(a, a, b, b, c);
     }
 
-    if (poly_id == 13) {
+    if (poly_id == kPolyAdvancedAbcPlusDe) {
         // advanced_abc_plus_de u32 full mont: a*b*c + d*e
         u32 a = load_line_mont(tables, len, 0, idx, half, x_mont, q);
         u32 b = load_line_mont(tables, len, 1, idx, half, x_mont, q);
@@ -2242,7 +2281,7 @@ __device__ __forceinline__ u32 eval_poly_at_x_mont(
         return add_mod(prod3(a, b, c), prod2(d, e), q);
     }
 
-    if (poly_id == 14) {
+    if (poly_id == kPolyAdvancedAbcgPlusDeg) {
         // advanced_abcg_plus_deg u32 full mont: a*b*c*g + d*e*g
         u32 a = load_line_mont(tables, len, 0, idx, half, x_mont, q);
         u32 b = load_line_mont(tables, len, 1, idx, half, x_mont, q);
@@ -2253,7 +2292,7 @@ __device__ __forceinline__ u32 eval_poly_at_x_mont(
         return add_mod(prod4(a, b, c, g), prod3(d, e, g), q);
     }
 
-    if (poly_id == 0) {
+    if (poly_id == kPolyVanillaGate) {
         u32 qL  = load_line_mont(tables, len, 0, idx, half, x_mont, q);
         u32 w1  = load_line_mont(tables, len, 1, idx, half, x_mont, q);
         u32 qR  = load_line_mont(tables, len, 2, idx, half, x_mont, q);
@@ -2271,7 +2310,7 @@ __device__ __forceinline__ u32 eval_poly_at_x_mont(
         return acc;
     }
 
-    if (poly_id == 1) {
+    if (poly_id == kPolyVanillaZero) {
         u32 qL  = load_line_mont(tables, len, 0, idx, half, x_mont, q);
         u32 w1  = load_line_mont(tables, len, 1, idx, half, x_mont, q);
         u32 qR  = load_line_mont(tables, len, 2, idx, half, x_mont, q);
@@ -2290,7 +2329,7 @@ __device__ __forceinline__ u32 eval_poly_at_x_mont(
         return acc;
     }
 
-    if (poly_id == 2) {
+    if (poly_id == kPolyVanillaPerm) {
         u32 pi   = load_line_mont(tables, len, 0, idx, half, x_mont, q);
         u32 np1  = load_line_mont(tables, len, 1, idx, half, x_mont, q);
         u32 p2   = load_line_mont(tables, len, 2, idx, half, x_mont, q);
@@ -2310,7 +2349,7 @@ __device__ __forceinline__ u32 eval_poly_at_x_mont(
         return acc;
     }
 
-    if (poly_id == 3) {
+    if (poly_id == kPolyOpencheck6) {
         #pragma unroll
         for (int r = 0; r < 6; ++r) {
             acc = add_mod(acc, load_line_mont(tables, len, r, idx, half, x_mont, q), q);
@@ -2318,7 +2357,9 @@ __device__ __forceinline__ u32 eval_poly_at_x_mont(
         return acc;
     }
 
-    if (poly_id == 5 || poly_id == 6 || poly_id == 7) {
+    if (poly_id == kPolyDegreeSweepDeg3 ||
+        poly_id == kPolyDegreeSweepDeg5 ||
+        poly_id == kPolyDegreeSweepDeg7) {
         u32 q1 = load_line_mont(tables, len, 0, idx, half, x_mont, q);
         u32 w1 = load_line_mont(tables, len, 1, idx, half, x_mont, q);
         u32 q2 = load_line_mont(tables, len, 2, idx, half, x_mont, q);
@@ -2329,9 +2370,9 @@ __device__ __forceinline__ u32 eval_poly_at_x_mont(
         acc = add_mod(acc, prod2(q1, w1), q);
         acc = add_mod(acc, prod2(q2, w2), q);
 
-        if (poly_id == 5) {
+        if (poly_id == kPolyDegreeSweepDeg3) {
             acc = add_mod(acc, prod3(qH, w1, w2), q);
-        } else if (poly_id == 6) {
+        } else if (poly_id == kPolyDegreeSweepDeg5) {
             acc = add_mod(acc, prod5(qH, w1, w1, w1, w2), q);
         } else {
             acc = add_mod(acc, prod7(qH, w1, w1, w1, w1, w1, w2), q);
@@ -2521,9 +2562,6 @@ torch::Tensor sumcheck_hyperplonk_full_mont_u32_cuda(
 
     int poly_id = static_cast<int>(poly_id_64);
 
-    if (poly_id == 4) {
-        throw std::invalid_argument("poly_id 4 is unused and not supported by full Montgomery path");
-    }
 
     int degree = hp_spec::degree_for_poly(poly_id);
     int rows = hp_spec::rows_for_poly(poly_id);
@@ -3696,19 +3734,19 @@ __device__ __forceinline__ u64 eval_hyperplonk_poly_at_x_mont_u64(
 
     u64 acc = 0;
 
-    if (poly_id == 8) {
+    if (poly_id == kPolyBaselineLinear) {
         // baseline_linear: a
         return load_line_mont(tables, len, 0, idx, half, x_mont);
     }
 
-    if (poly_id == 9) {
+    if (poly_id == kPolyBaselineMul) {
         // baseline_mul: a*b
         u64 a = load_line_mont(tables, len, 0, idx, half, x_mont);
         u64 b = load_line_mont(tables, len, 1, idx, half, x_mont);
         return prod2_spec(a, b);
     }
 
-    if (poly_id == 10) {
+    if (poly_id == kPolyBaselineMulAdd) {
         // baseline_mul_add: a*b + c
         u64 a = load_line_mont(tables, len, 0, idx, half, x_mont);
         u64 b = load_line_mont(tables, len, 1, idx, half, x_mont);
@@ -3716,7 +3754,7 @@ __device__ __forceinline__ u64 eval_hyperplonk_poly_at_x_mont_u64(
         return add_mod(prod2_spec(a, b), c);
     }
 
-    if (poly_id == 11) {
+    if (poly_id == kPolyBaselineCubicProduct) {
         // baseline_cubic_product: a*b*c
         u64 a = load_line_mont(tables, len, 0, idx, half, x_mont);
         u64 b = load_line_mont(tables, len, 1, idx, half, x_mont);
@@ -3725,7 +3763,7 @@ __device__ __forceinline__ u64 eval_hyperplonk_poly_at_x_mont_u64(
     }
 
 
-    if (poly_id == 12) {
+    if (poly_id == kPolyAdvancedA2B2C) {
         // advanced_a2b2c u64 full mont: a*a*b*b*c
         u64 a = load_line_mont(tables, len, 0, idx, half, x_mont);
         u64 b = load_line_mont(tables, len, 1, idx, half, x_mont);
@@ -3733,7 +3771,7 @@ __device__ __forceinline__ u64 eval_hyperplonk_poly_at_x_mont_u64(
         return prod5_spec(a, a, b, b, c);
     }
 
-    if (poly_id == 13) {
+    if (poly_id == kPolyAdvancedAbcPlusDe) {
         // advanced_abc_plus_de u64 full mont: a*b*c + d*e
         u64 a = load_line_mont(tables, len, 0, idx, half, x_mont);
         u64 b = load_line_mont(tables, len, 1, idx, half, x_mont);
@@ -3743,7 +3781,7 @@ __device__ __forceinline__ u64 eval_hyperplonk_poly_at_x_mont_u64(
         return add_mod(prod3_spec(a, b, c), prod2_spec(d, e));
     }
 
-    if (poly_id == 14) {
+    if (poly_id == kPolyAdvancedAbcgPlusDeg) {
         // advanced_abcg_plus_deg u64 full mont: a*b*c*g + d*e*g
         u64 a = load_line_mont(tables, len, 0, idx, half, x_mont);
         u64 b = load_line_mont(tables, len, 1, idx, half, x_mont);
@@ -3754,7 +3792,7 @@ __device__ __forceinline__ u64 eval_hyperplonk_poly_at_x_mont_u64(
         return add_mod(prod4_spec(a, b, c, g), prod3_spec(d, e, g));
     }
 
-    if (poly_id == 0) {
+    if (poly_id == kPolyVanillaGate) {
         // vanilla_gate:
         // qL*w1 + qR*w2 + qM*w1*w2 + neg_qO*w3 + qC
         u64 qL  = load_line_mont(tables, len, 0, idx, half, x_mont);
@@ -3774,7 +3812,7 @@ __device__ __forceinline__ u64 eval_hyperplonk_poly_at_x_mont_u64(
         return acc;
     }
 
-    if (poly_id == 1) {
+    if (poly_id == kPolyVanillaZero) {
         // vanilla_zero = vanilla_gate * fr, termwise.
         u64 qL  = load_line_mont(tables, len, 0, idx, half, x_mont);
         u64 w1  = load_line_mont(tables, len, 1, idx, half, x_mont);
@@ -3794,7 +3832,7 @@ __device__ __forceinline__ u64 eval_hyperplonk_poly_at_x_mont_u64(
         return acc;
     }
 
-    if (poly_id == 2) {
+    if (poly_id == kPolyVanillaPerm) {
         // vanilla_perm:
         // (pi - p1*p2 + alpha_phi*D1*D2*D3 - alpha*N1*N2*N3) * fr
         // Signs/scalars are folded into input rows.
@@ -3817,7 +3855,7 @@ __device__ __forceinline__ u64 eval_hyperplonk_poly_at_x_mont_u64(
         return acc;
     }
 
-    if (poly_id == 3) {
+    if (poly_id == kPolyOpencheck6) {
         // opencheck_6: y1*k1 + ... + y6*k6
         #pragma unroll
         for (int r = 0; r < 6; ++r) {
@@ -3829,7 +3867,9 @@ __device__ __forceinline__ u64 eval_hyperplonk_poly_at_x_mont_u64(
         return acc;
     }
 
-    if (poly_id == 5 || poly_id == 6 || poly_id == 7) {
+    if (poly_id == kPolyDegreeSweepDeg3 ||
+        poly_id == kPolyDegreeSweepDeg5 ||
+        poly_id == kPolyDegreeSweepDeg7) {
         // degree_sweep:
         // q1*w1 + q2*w2 + qH*w1^k*w2 + qC
         u64 q1 = load_line_mont(tables, len, 0, idx, half, x_mont);
@@ -3842,9 +3882,9 @@ __device__ __forceinline__ u64 eval_hyperplonk_poly_at_x_mont_u64(
         acc = add_mod(acc, prod2_spec(q1, w1));
         acc = add_mod(acc, prod2_spec(q2, w2));
 
-        if (poly_id == 5) {
+        if (poly_id == kPolyDegreeSweepDeg3) {
             acc = add_mod(acc, prod3_spec(qH, w1, w2));
-        } else if (poly_id == 6) {
+        } else if (poly_id == kPolyDegreeSweepDeg5) {
             acc = add_mod(acc, prod5_spec(qH, w1, w1, w1, w2));
         } else {
             acc = add_mod(acc, prod7_spec(qH, w1, w1, w1, w1, w1, w2));
@@ -3948,9 +3988,6 @@ torch::Tensor sumcheck_hyperplonk_full_mont_u64_cuda(
 
     int poly_id = static_cast<int>(poly_id_64);
 
-    if (poly_id == 4) {
-        throw std::invalid_argument("poly_id 4 is unused");
-    }
 
     int degree = hp_spec::degree_for_poly(poly_id);
     int rows = hp_spec::rows_for_poly(poly_id);
@@ -5343,19 +5380,19 @@ __device__ __forceinline__ u128x eval_hyperplonk_poly_at_x_mont_u128(
 
     u128x acc{0ULL, 0ULL};
 
-    if (poly_id == 8) {
+    if (poly_id == kPolyBaselineLinear) {
         // baseline_linear: a
         return load_line_mont_u128(tables_lo, tables_hi, len, 0, idx, half, x_mont);
     }
 
-    if (poly_id == 9) {
+    if (poly_id == kPolyBaselineMul) {
         // baseline_mul: a*b
         u128x a = load_line_mont_u128(tables_lo, tables_hi, len, 0, idx, half, x_mont);
         u128x b = load_line_mont_u128(tables_lo, tables_hi, len, 1, idx, half, x_mont);
         return prod2_spec_u128(a, b);
     }
 
-    if (poly_id == 10) {
+    if (poly_id == kPolyBaselineMulAdd) {
         // baseline_mul_add: a*b + c
         u128x a = load_line_mont_u128(tables_lo, tables_hi, len, 0, idx, half, x_mont);
         u128x b = load_line_mont_u128(tables_lo, tables_hi, len, 1, idx, half, x_mont);
@@ -5363,7 +5400,7 @@ __device__ __forceinline__ u128x eval_hyperplonk_poly_at_x_mont_u128(
         return add_mod_u128(prod2_spec_u128(a, b), c);
     }
 
-    if (poly_id == 11) {
+    if (poly_id == kPolyBaselineCubicProduct) {
         // baseline_cubic_product: a*b*c
         u128x a = load_line_mont_u128(tables_lo, tables_hi, len, 0, idx, half, x_mont);
         u128x b = load_line_mont_u128(tables_lo, tables_hi, len, 1, idx, half, x_mont);
@@ -5371,7 +5408,7 @@ __device__ __forceinline__ u128x eval_hyperplonk_poly_at_x_mont_u128(
         return prod3_spec_u128(a, b, c);
     }
 
-    if (poly_id == 12) {
+    if (poly_id == kPolyAdvancedA2B2C) {
         // advanced_a2b2c: a*a*b*b*c
         u128x a = load_line_mont_u128(tables_lo, tables_hi, len, 0, idx, half, x_mont);
         u128x b = load_line_mont_u128(tables_lo, tables_hi, len, 1, idx, half, x_mont);
@@ -5379,7 +5416,7 @@ __device__ __forceinline__ u128x eval_hyperplonk_poly_at_x_mont_u128(
         return prod5_spec_u128(a, a, b, b, c);
     }
 
-    if (poly_id == 13) {
+    if (poly_id == kPolyAdvancedAbcPlusDe) {
         // advanced_abc_plus_de: a*b*c + d*e
         u128x a = load_line_mont_u128(tables_lo, tables_hi, len, 0, idx, half, x_mont);
         u128x b = load_line_mont_u128(tables_lo, tables_hi, len, 1, idx, half, x_mont);
@@ -5389,7 +5426,7 @@ __device__ __forceinline__ u128x eval_hyperplonk_poly_at_x_mont_u128(
         return add_mod_u128(prod3_spec_u128(a, b, c), prod2_spec_u128(d, e));
     }
 
-    if (poly_id == 14) {
+    if (poly_id == kPolyAdvancedAbcgPlusDeg) {
         // advanced_abcg_plus_deg: a*b*c*g + d*e*g
         u128x a = load_line_mont_u128(tables_lo, tables_hi, len, 0, idx, half, x_mont);
         u128x b = load_line_mont_u128(tables_lo, tables_hi, len, 1, idx, half, x_mont);
@@ -5400,7 +5437,7 @@ __device__ __forceinline__ u128x eval_hyperplonk_poly_at_x_mont_u128(
         return add_mod_u128(prod4_spec_u128(a, b, c, g), prod3_spec_u128(d, e, g));
     }
 
-    if (poly_id == 0) {
+    if (poly_id == kPolyVanillaGate) {
         // vanilla_gate:
         // qL*w1 + qR*w2 + qM*w1*w2 + neg_qO*w3 + qC
         u128x qL  = load_line_mont_u128(tables_lo, tables_hi, len, 0, idx, half, x_mont);
@@ -5420,7 +5457,7 @@ __device__ __forceinline__ u128x eval_hyperplonk_poly_at_x_mont_u128(
         return acc;
     }
 
-    if (poly_id == 1) {
+    if (poly_id == kPolyVanillaZero) {
         // vanilla_zero = vanilla_gate * fr, termwise.
         u128x qL  = load_line_mont_u128(tables_lo, tables_hi, len, 0, idx, half, x_mont);
         u128x w1  = load_line_mont_u128(tables_lo, tables_hi, len, 1, idx, half, x_mont);
@@ -5440,7 +5477,7 @@ __device__ __forceinline__ u128x eval_hyperplonk_poly_at_x_mont_u128(
         return acc;
     }
 
-    if (poly_id == 2) {
+    if (poly_id == kPolyVanillaPerm) {
         // vanilla_perm:
         // (pi - p1*p2 + alpha_phi*D1*D2*D3 - alpha*N1*N2*N3) * fr
         // Signs/scalars are folded into input rows.
@@ -5463,7 +5500,7 @@ __device__ __forceinline__ u128x eval_hyperplonk_poly_at_x_mont_u128(
         return acc;
     }
 
-    if (poly_id == 3) {
+    if (poly_id == kPolyOpencheck6) {
         // opencheck_6: y1*k1 + ... + y6*k6
         #pragma unroll
         for (int r = 0; r < 6; ++r) {
@@ -5475,7 +5512,9 @@ __device__ __forceinline__ u128x eval_hyperplonk_poly_at_x_mont_u128(
         return acc;
     }
 
-    if (poly_id == 5 || poly_id == 6 || poly_id == 7) {
+    if (poly_id == kPolyDegreeSweepDeg3 ||
+        poly_id == kPolyDegreeSweepDeg5 ||
+        poly_id == kPolyDegreeSweepDeg7) {
         // degree_sweep:
         // q1*w1 + q2*w2 + qH*w1^k*w2 + qC
         u128x q1 = load_line_mont_u128(tables_lo, tables_hi, len, 0, idx, half, x_mont);
@@ -5488,9 +5527,9 @@ __device__ __forceinline__ u128x eval_hyperplonk_poly_at_x_mont_u128(
         acc = add_mod_u128(acc, prod2_spec_u128(q1, w1));
         acc = add_mod_u128(acc, prod2_spec_u128(q2, w2));
 
-        if (poly_id == 5) {
+        if (poly_id == kPolyDegreeSweepDeg3) {
             acc = add_mod_u128(acc, prod3_spec_u128(qH, w1, w2));
-        } else if (poly_id == 6) {
+        } else if (poly_id == kPolyDegreeSweepDeg5) {
             acc = add_mod_u128(acc, prod5_spec_u128(qH, w1, w1, w1, w2));
         } else {
             acc = add_mod_u128(acc, prod7_spec_u128(qH, w1, w1, w1, w1, w1, w2));
@@ -5605,9 +5644,6 @@ std::tuple<torch::Tensor, torch::Tensor> sumcheck_hyperplonk_full_mont_u128_cuda
 
     int poly_id = static_cast<int>(poly_id_64);
 
-    if (poly_id == 4) {
-        throw std::invalid_argument("poly_id 4 is unused");
-    }
 
     int degree = hp_spec::degree_for_poly(poly_id);
     int rows = hp_spec::rows_for_poly(poly_id);

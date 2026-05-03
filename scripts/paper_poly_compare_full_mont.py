@@ -42,7 +42,25 @@ def bench(fn, warmup, runs):
     return first_ms, med, p90, out
 
 
-def build_full_mont_call(tables, chals, poly_name):
+def build_full_mont_generic_call(tables, chals, terms):
+    offsets, flat = base.flatten_terms(terms)
+    term_offsets = torch.tensor(offsets, dtype=torch.int32)
+    term_vars = torch.tensor(flat, dtype=torch.int32)
+
+    def fn():
+        _claim0, out = sumcheck_cuda_ext.sumcheck_terms_full_mont_u32_cuda(
+            tables,
+            chals,
+            term_offsets,
+            term_vars,
+            Q32,
+        )
+        return out
+
+    return fn
+
+
+def build_full_mont_specialized_call(tables, chals, poly_name):
     poly_id = base.POLY_IDS[poly_name]
 
     def fn():
@@ -74,8 +92,13 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
-    if not hasattr(sumcheck_cuda_ext, "sumcheck_hyperplonk_full_mont_u32_cuda"):
-        raise RuntimeError("extension does not expose sumcheck_hyperplonk_full_mont_u32_cuda")
+    required = [
+        "sumcheck_terms_full_mont_u32_cuda",
+        "sumcheck_hyperplonk_full_mont_u32_cuda",
+    ]
+    for name in required:
+        if not hasattr(sumcheck_cuda_ext, name):
+            raise RuntimeError(f"extension does not expose {name}")
 
     num_vars_list = [int(x) for x in args.num_vars.split(",")]
 
@@ -93,16 +116,16 @@ def main():
         "template",
         "N",
         "deg",
-        "generic_ms",
+        "wrapped_generic_ms",
+        "full_generic_ms",
         "wrapped_spec_ms",
-        "full_mont_ms",
-        "wrapped_speed",
-        "full_mont_speed",
-        "full_mont_p90",
+        "full_spec_ms",
+        "full_generic_speed",
+        "full_spec_speed",
         "shape",
     ]
 
-    widths = [24, 10, 4, 12, 16, 13, 13, 15, 14, 12]
+    widths = [24, 10, 4, 18, 16, 16, 13, 18, 15, 12]
 
     for nv in num_vars_list:
         print()
@@ -112,6 +135,9 @@ def main():
         print("-+-".join("-" * w for w in widths))
 
         for poly in poly_names:
+            if poly not in base.POLYS:
+                raise ValueError(f"unknown polynomial template {poly}")
+
             terms = base.POLYS[poly]
             tables, chals = base.make_inputs(
                 terms,
@@ -119,26 +145,32 @@ def main():
                 args.seed + nv + base.POLY_IDS[poly] * 100,
             )
 
-            generic_fn = base.build_generic_call(tables, chals, terms)
+            wrapped_generic_fn = base.build_generic_call(tables, chals, terms)
+            full_generic_fn = build_full_mont_generic_call(tables, chals, terms)
             wrapped_spec_fn = base.build_specialized_call(tables, chals, poly)
-            full_mont_fn = build_full_mont_call(tables, chals, poly)
+            full_spec_fn = build_full_mont_specialized_call(tables, chals, poly)
 
-            _gf, gmed, _gp90, gout = bench(generic_fn, args.warmup, args.runs)
-            _sf, smed, _sp90, sout = bench(wrapped_spec_fn, args.warmup, args.runs)
-            _mf, mmed, mp90, mout = bench(full_mont_fn, args.warmup, args.runs)
+            _wgf, wgmed, _wgp90, wgout = bench(wrapped_generic_fn, args.warmup, args.runs)
+            _fgf, fgmed, _fgp90, fgout = bench(full_generic_fn, args.warmup, args.runs)
+            _wsf, wsmed, _wsp90, wsout = bench(wrapped_spec_fn, args.warmup, args.runs)
+            _fsf, fsmed, _fsp90, fsout = bench(full_spec_fn, args.warmup, args.runs)
 
             if args.check:
-                g = gout.detach().cpu()
-                s = sout.detach().cpu()
-                m = mout.detach().cpu()
+                ref = wgout.detach().cpu()
+                fg = fgout.detach().cpu()
+                ws = wsout.detach().cpu()
+                fs = fsout.detach().cpu()
 
-                if not torch.equal(g, s):
-                    diff = (g != s).nonzero()[0].tolist()
-                    raise AssertionError(f"generic/wrapped mismatch {poly} nv={nv} first={diff}")
-
-                if not torch.equal(g, m):
-                    diff = (g != m).nonzero()[0].tolist()
-                    raise AssertionError(f"generic/full_mont mismatch {poly} nv={nv} first={diff}")
+                for label, val in [
+                    ("full_generic", fg),
+                    ("wrapped_spec", ws),
+                    ("full_spec", fs),
+                ]:
+                    if not torch.equal(ref, val):
+                        diff = (ref != val).nonzero()[0].tolist()
+                        raise AssertionError(
+                            f"wrapped_generic/{label} mismatch {poly} nv={nv} first={diff}"
+                        )
 
             n = 1 << nv
 
@@ -146,13 +178,13 @@ def main():
                 poly,
                 f"{n:d}",
                 f"{base.degree_for_terms(terms):d}",
-                f"{gmed:.3f}",
-                f"{smed:.3f}",
-                f"{mmed:.3f}",
-                f"{gmed / smed:.2f}x",
-                f"{gmed / mmed:.2f}x",
-                f"{mp90:.3f}",
-                str(tuple(gout.shape)),
+                f"{wgmed:.3f}",
+                f"{fgmed:.3f}",
+                f"{wsmed:.3f}",
+                f"{fsmed:.3f}",
+                f"{wgmed / fgmed:.2f}x",
+                f"{wgmed / fsmed:.2f}x",
+                str(tuple(wgout.shape)),
             ]
 
             print(fmt_row(row, widths))

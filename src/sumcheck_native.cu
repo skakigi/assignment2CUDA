@@ -1711,6 +1711,21 @@ __device__ __forceinline__ u32 eval_poly_at_x(
     return 0;
 }
 
+__device__ __forceinline__ u32 warp_reduce_add_mod(u32 value, u32 q) {
+    // Reduce one u32 modular sum within a warp using register shuffles.
+    // This avoids the full shared-memory tree reduction used by the first
+    // specialized implementation.
+    unsigned mask = 0xffffffffu;
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        u32 other = __shfl_down_sync(mask, value, offset);
+        value = add_mod(value, other, q);
+    }
+
+    return value;
+}
+
 __global__ void eval_kernel(
     const u32* __restrict__ tables,
     int len,
@@ -1720,43 +1735,66 @@ __global__ void eval_kernel(
     u32* __restrict__ partials) {
 
     extern __shared__ u32 shared[];
-    int tid = threadIdx.x;
-    int half = len >> 1;
+
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp_id = tid >> 5;
+    const int num_warps = (blockDim.x + 31) >> 5;
+    const int half = len >> 1;
 
     u32 local[8];
+
     #pragma unroll
     for (int x = 0; x < 8; ++x) {
         local[x] = 0;
     }
 
+    // Each thread accumulates local partial sums for all evaluation points.
     for (int i = blockIdx.x * blockDim.x + tid;
          i < half;
          i += blockDim.x * gridDim.x) {
         for (int x = 0; x <= degree; ++x) {
-            u32 y = eval_poly_at_x(tables, len, i, half, poly_id, static_cast<u32>(x), q);
+            u32 y = eval_poly_at_x(
+                tables,
+                len,
+                i,
+                half,
+                poly_id,
+                static_cast<u32>(x),
+                q
+            );
             local[x] = add_mod(local[x], y, q);
         }
     }
 
+    // First reduce inside each warp using shuffle instructions.
     for (int x = 0; x <= degree; ++x) {
-        shared[x * blockDim.x + tid] = local[x];
+        u32 reduced = warp_reduce_add_mod(local[x], q);
+        if (lane == 0) {
+            shared[x * num_warps + warp_id] = reduced;
+        }
     }
+
     __syncthreads();
 
-    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            for (int x = 0; x <= degree; ++x) {
-                u32* row = shared + x * blockDim.x;
-                row[tid] = add_mod(row[tid], row[tid + stride], q);
-            }
-        }
-        __syncthreads();
-    }
-
-    if (tid == 0) {
+    // Then let the first warp reduce the per-warp partials.
+    if (warp_id == 0) {
         for (int x = 0; x <= degree; ++x) {
-            partials[static_cast<size_t>(blockIdx.x) * static_cast<size_t>(degree + 1) + x] =
-                shared[x * blockDim.x];
+            u32 value = 0;
+
+            if (lane < num_warps) {
+                value = shared[x * num_warps + lane];
+            }
+
+            value = warp_reduce_add_mod(value, q);
+
+            if (lane == 0) {
+                partials[
+                    static_cast<size_t>(blockIdx.x) *
+                    static_cast<size_t>(degree + 1) +
+                    x
+                ] = value;
+            }
         }
     }
 }

@@ -26,6 +26,26 @@ def to_number(x: str):
     return x
 
 
+def infer_variant_from_path(path: Path) -> str:
+    name = path.stem.lower()
+    for variant in [
+        "mle_tiled_warp",
+        "tiledwarp",
+        "mle_tiled_shared",
+        "tiledshared",
+        "reduce",
+        "compiled",
+        "baseline",
+        "xconst",
+        "tiled2",
+        "tiled4",
+        "auto",
+    ]:
+        if variant in name:
+            return variant
+    return "unknown"
+
+
 def parse_logs(paths: Iterable[Path]) -> list[dict]:
     rows: list[dict] = []
 
@@ -33,6 +53,7 @@ def parse_logs(paths: Iterable[Path]) -> list[dict]:
         bits = None
         num_vars = None
         device = None
+        variant = infer_variant_from_path(path)
         current_header: list[str] | None = None
 
         for raw in path.read_text(errors="replace").splitlines():
@@ -81,6 +102,7 @@ def parse_logs(paths: Iterable[Path]) -> list[dict]:
 
             rec = {k: to_number(v) for k, v in zip(current_header, parts)}
             rec["source_log"] = str(path)
+            rec["variant"] = variant
             if bits is not None:
                 rec["bits"] = bits
             if num_vars is not None:
@@ -104,6 +126,7 @@ def write_csv(rows: list[dict], out: Path) -> None:
     preferred = [
         "source_log",
         "device",
+        "variant",
         "bits",
         "num_vars",
         "template",
@@ -164,7 +187,7 @@ def plot_csv(csv_path: Path, out_dir: Path) -> None:
     else:
         ycols = [c for c in ["median_ms", "p90_ms"] if c in df.columns]
 
-    group_cols = [c for c in ["device", "bits", "num_vars"] if c in df.columns]
+    group_cols = [c for c in ["device", "bits", "num_vars", "variant"] if c in df.columns]
 
     grouped = df.groupby(group_cols, dropna=False) if group_cols else [((), df)]
 

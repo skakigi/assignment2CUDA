@@ -8,6 +8,67 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+
+// ============================================================================
+// Experimental Montgomery multiply path for q = 2^32 - 5.
+// This is a correctness-first normal-domain wrapper:
+//
+//   normal a,b -> Montgomery aR,bR -> MontMul -> normal ab
+//
+// This is expected to be slower than a fully Montgomery-domain SumCheck,
+// but it lets us test Montgomery reduction correctness/performance in isolation.
+// ============================================================================
+
+#ifndef SUMCHECK_EXPERIMENTAL_MONTGOMERY_MUL
+#define SUMCHECK_EXPERIMENTAL_MONTGOMERY_MUL 1
+#endif
+
+__device__ __forceinline__ uint32_t sumcheck_mont_redc_q32(uint64_t t) {
+    constexpr uint64_t Q = 4294967291ULL;
+    constexpr uint32_t NPRIME = 0xCCCCCCCDu; // -q^{-1} mod 2^32
+
+    uint32_t m = static_cast<uint32_t>(t) * NPRIME;
+    uint64_t mn = static_cast<uint64_t>(m) * Q;
+
+    // REDC needs (t + m*q) >> 32.  The sum can require 65 bits,
+    // so preserve the carry from the 64-bit addition.
+    uint64_t sum = t + mn;
+    uint64_t carry = (sum < t) ? 1ULL : 0ULL;
+    uint64_t u = (sum >> 32) | (carry << 32);
+
+    if (u >= Q) {
+        u -= Q;
+    }
+    return static_cast<uint32_t>(u);
+}
+
+__device__ __forceinline__ uint32_t sumcheck_mont_to_mont_q32(uint32_t a) {
+    // R mod q = 2^32 mod (2^32 - 5) = 5.
+    uint64_t z = static_cast<uint64_t>(a) * 5ULL;
+
+    // z is small, but use correction instead of %.
+    constexpr uint64_t Q = 4294967291ULL;
+    while (z >= Q) {
+        z -= Q;
+    }
+    return static_cast<uint32_t>(z);
+}
+
+__device__ __forceinline__ uint32_t sumcheck_mont_mul_mont_q32(uint32_t a_mont, uint32_t b_mont) {
+    return sumcheck_mont_redc_q32(static_cast<uint64_t>(a_mont) * static_cast<uint64_t>(b_mont));
+}
+
+__device__ __forceinline__ uint32_t sumcheck_mont_from_mont_q32(uint32_t a_mont) {
+    return sumcheck_mont_redc_q32(static_cast<uint64_t>(a_mont));
+}
+
+__device__ __forceinline__ uint32_t sumcheck_mont_mul_normal_q32(uint32_t a, uint32_t b) {
+    uint32_t a_mont = sumcheck_mont_to_mont_q32(a);
+    uint32_t b_mont = sumcheck_mont_to_mont_q32(b);
+    uint32_t c_mont = sumcheck_mont_mul_mont_q32(a_mont, b_mont);
+    return sumcheck_mont_from_mont_q32(c_mont);
+}
+
 #include <cstdlib>
 #include <sstream>
 #include <string>
@@ -1476,7 +1537,11 @@ __device__ __forceinline__ u32 reduce_q32_fast(u64 z) {
 __device__ __forceinline__ u32 mul_mod(u32 a, u32 b, u32 q) {
     u64 z = static_cast<u64>(a) * static_cast<u64>(b);
     if (q == Q32_FAST) {
+#if SUMCHECK_EXPERIMENTAL_MONTGOMERY_MUL
+        return sumcheck_mont_mul_normal_q32(a, b);
+#else
         return reduce_q32_fast(z);
+#endif
     }
     return static_cast<u32>(z % static_cast<u64>(q));
 }

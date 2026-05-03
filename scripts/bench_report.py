@@ -46,6 +46,16 @@ def infer_variant_from_path(path: Path) -> str:
     return "unknown"
 
 
+
+def infer_challenge_mode_from_path(path: Path) -> str:
+    name = path.stem.lower()
+    if "unhashed" in name or "plain_challenge" in name or "fixed_challenge" in name:
+        return "unhashed"
+    if "hashed" in name or "sha3" in name or "transcript" in name:
+        return "hashed"
+    return "unknown"
+
+
 def parse_logs(paths: Iterable[Path]) -> list[dict]:
     rows: list[dict] = []
 
@@ -54,6 +64,7 @@ def parse_logs(paths: Iterable[Path]) -> list[dict]:
         num_vars = None
         device = None
         variant = infer_variant_from_path(path)
+        challenge_mode = infer_challenge_mode_from_path(path)
         current_header: list[str] | None = None
 
         for raw in path.read_text(errors="replace").splitlines():
@@ -70,6 +81,15 @@ def parse_logs(paths: Iterable[Path]) -> list[dict]:
             m = re.search(r"device:\s*(.+)$", line)
             if m:
                 device = m.group(1).strip()
+
+            m = re.search(r"challenge mode:\s*(.+)$", line)
+            if m:
+                text = m.group(1).strip()
+                lowered = text.lower()
+                if "sha3" in lowered or "transcript" in lowered or "hash" in lowered:
+                    challenge_mode = "hashed"
+                else:
+                    challenge_mode = "unhashed"
 
             if "|" not in line:
                 continue
@@ -103,6 +123,7 @@ def parse_logs(paths: Iterable[Path]) -> list[dict]:
             rec = {k: to_number(v) for k, v in zip(current_header, parts)}
             rec["source_log"] = str(path)
             rec["variant"] = variant
+            rec["challenge_mode"] = challenge_mode
             if bits is not None:
                 rec["bits"] = bits
             if num_vars is not None:
@@ -127,6 +148,7 @@ def write_csv(rows: list[dict], out: Path) -> None:
         "source_log",
         "device",
         "variant",
+        "challenge_mode",
         "bits",
         "num_vars",
         "template",
@@ -187,7 +209,7 @@ def plot_csv(csv_path: Path, out_dir: Path) -> None:
     else:
         ycols = [c for c in ["median_ms", "p90_ms"] if c in df.columns]
 
-    group_cols = [c for c in ["device", "bits", "num_vars", "variant"] if c in df.columns]
+    group_cols = [c for c in ["device", "bits", "num_vars", "variant", "challenge_mode"] if c in df.columns]
 
     grouped = df.groupby(group_cols, dropna=False) if group_cols else [((), df)]
 

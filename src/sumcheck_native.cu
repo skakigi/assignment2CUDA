@@ -2267,6 +2267,26 @@ __device__ __forceinline__ u32 eval_poly_values_reuse(
     return 0;
 }
 
+
+__device__ __forceinline__ void load_vd_reuse(
+    const u32* __restrict__ tables,
+    int len,
+    int row,
+    int idx,
+    int half,
+    u32 q,
+    u32& v,
+    u32& d) {
+
+    const u32* r = tables + static_cast<size_t>(row) * static_cast<size_t>(len);
+    v = r[idx];
+    d = sub_mod(r[idx + half], v, q);
+}
+
+__device__ __forceinline__ void adv_reuse(u32& v, u32 d, u32 q) {
+    v = add_mod(v, d, q);
+}
+
 __device__ __forceinline__ void eval_poly_all_x_reuse_tiled(
     const u32* __restrict__ tables,
     int len,
@@ -2278,37 +2298,264 @@ __device__ __forceinline__ void eval_poly_all_x_reuse_tiled(
     u32 q,
     u32 out[8]) {
 
-    u32 v[REUSE_MAX_ROWS];
-    u32 d[REUSE_MAX_ROWS];
-
-    #pragma unroll
-    for (int r = 0; r < REUSE_MAX_ROWS; ++r) {
-        if (r < rows) {
-            const u32* row = tables + static_cast<size_t>(r) * static_cast<size_t>(len);
-            u32 z = row[idx];
-            u32 o = row[idx + half];
-            v[r] = z;
-            d[r] = sub_mod(o, z, q);
-        } else {
-            v[r] = 0;
-            d[r] = 0;
-        }
-    }
-
     #pragma unroll
     for (int x = 0; x < 8; ++x) {
         out[x] = 0;
     }
 
-    for (int x = 0; x <= degree; ++x) {
-        out[x] = eval_poly_values_reuse(v, poly_id, q);
+    // baseline_linear: a
+    if (poly_id == 8) {
+        u32 a, da;
+        load_vd_reuse(tables, len, 0, idx, half, q, a, da);
 
-        #pragma unroll
-        for (int r = 0; r < REUSE_MAX_ROWS; ++r) {
-            if (r < rows) {
-                v[r] = add_mod(v[r], d[r], q);
-            }
+        for (int x = 0; x <= degree; ++x) {
+            out[x] = a;
+            adv_reuse(a, da, q);
         }
+        return;
+    }
+
+    // baseline_mul: a*b
+    if (poly_id == 9) {
+        u32 a, da, b, db;
+        load_vd_reuse(tables, len, 0, idx, half, q, a, da);
+        load_vd_reuse(tables, len, 1, idx, half, q, b, db);
+
+        for (int x = 0; x <= degree; ++x) {
+            out[x] = prod2(a, b, q);
+            adv_reuse(a, da, q);
+            adv_reuse(b, db, q);
+        }
+        return;
+    }
+
+    // baseline_mul_add: a*b + c
+    if (poly_id == 10) {
+        u32 a, da, b, db, c, dc;
+        load_vd_reuse(tables, len, 0, idx, half, q, a, da);
+        load_vd_reuse(tables, len, 1, idx, half, q, b, db);
+        load_vd_reuse(tables, len, 2, idx, half, q, c, dc);
+
+        for (int x = 0; x <= degree; ++x) {
+            out[x] = add_mod(prod2(a, b, q), c, q);
+            adv_reuse(a, da, q);
+            adv_reuse(b, db, q);
+            adv_reuse(c, dc, q);
+        }
+        return;
+    }
+
+    // baseline_cubic_product: a*b*c
+    if (poly_id == 11) {
+        u32 a, da, b, db, c, dc;
+        load_vd_reuse(tables, len, 0, idx, half, q, a, da);
+        load_vd_reuse(tables, len, 1, idx, half, q, b, db);
+        load_vd_reuse(tables, len, 2, idx, half, q, c, dc);
+
+        for (int x = 0; x <= degree; ++x) {
+            out[x] = prod3(a, b, c, q);
+            adv_reuse(a, da, q);
+            adv_reuse(b, db, q);
+            adv_reuse(c, dc, q);
+        }
+        return;
+    }
+
+    // vanilla_gate:
+    // qL*w1 + qR*w2 + qM*w1*w2 + neg_qO*w3 + qC
+    if (poly_id == 0) {
+        u32 qL, dqL, w1, dw1, qR, dqR, w2, dw2;
+        u32 qM, dqM, nqO, dnqO, w3, dw3, qC, dqC;
+
+        load_vd_reuse(tables, len, 0, idx, half, q, qL, dqL);
+        load_vd_reuse(tables, len, 1, idx, half, q, w1, dw1);
+        load_vd_reuse(tables, len, 2, idx, half, q, qR, dqR);
+        load_vd_reuse(tables, len, 3, idx, half, q, w2, dw2);
+        load_vd_reuse(tables, len, 4, idx, half, q, qM, dqM);
+        load_vd_reuse(tables, len, 5, idx, half, q, nqO, dnqO);
+        load_vd_reuse(tables, len, 6, idx, half, q, w3, dw3);
+        load_vd_reuse(tables, len, 7, idx, half, q, qC, dqC);
+
+        for (int x = 0; x <= degree; ++x) {
+            u32 acc = 0;
+            acc = add_mod(acc, prod2(qL, w1, q), q);
+            acc = add_mod(acc, prod2(qR, w2, q), q);
+            acc = add_mod(acc, prod3(qM, w1, w2, q), q);
+            acc = add_mod(acc, prod2(nqO, w3, q), q);
+            acc = add_mod(acc, qC, q);
+            out[x] = acc;
+
+            adv_reuse(qL, dqL, q);
+            adv_reuse(w1, dw1, q);
+            adv_reuse(qR, dqR, q);
+            adv_reuse(w2, dw2, q);
+            adv_reuse(qM, dqM, q);
+            adv_reuse(nqO, dnqO, q);
+            adv_reuse(w3, dw3, q);
+            adv_reuse(qC, dqC, q);
+        }
+        return;
+    }
+
+    // vanilla_zero = vanilla_gate * fr, termwise
+    if (poly_id == 1) {
+        u32 qL, dqL, w1, dw1, qR, dqR, w2, dw2;
+        u32 qM, dqM, nqO, dnqO, w3, dw3, qC, dqC, fr, dfr;
+
+        load_vd_reuse(tables, len, 0, idx, half, q, qL, dqL);
+        load_vd_reuse(tables, len, 1, idx, half, q, w1, dw1);
+        load_vd_reuse(tables, len, 2, idx, half, q, qR, dqR);
+        load_vd_reuse(tables, len, 3, idx, half, q, w2, dw2);
+        load_vd_reuse(tables, len, 4, idx, half, q, qM, dqM);
+        load_vd_reuse(tables, len, 5, idx, half, q, nqO, dnqO);
+        load_vd_reuse(tables, len, 6, idx, half, q, w3, dw3);
+        load_vd_reuse(tables, len, 7, idx, half, q, qC, dqC);
+        load_vd_reuse(tables, len, 8, idx, half, q, fr, dfr);
+
+        for (int x = 0; x <= degree; ++x) {
+            u32 acc = 0;
+            acc = add_mod(acc, prod3(qL, w1, fr, q), q);
+            acc = add_mod(acc, prod3(qR, w2, fr, q), q);
+            acc = add_mod(acc, prod4(qM, w1, w2, fr, q), q);
+            acc = add_mod(acc, prod3(nqO, w3, fr, q), q);
+            acc = add_mod(acc, prod2(qC, fr, q), q);
+            out[x] = acc;
+
+            adv_reuse(qL, dqL, q);
+            adv_reuse(w1, dw1, q);
+            adv_reuse(qR, dqR, q);
+            adv_reuse(w2, dw2, q);
+            adv_reuse(qM, dqM, q);
+            adv_reuse(nqO, dnqO, q);
+            adv_reuse(w3, dw3, q);
+            adv_reuse(qC, dqC, q);
+            adv_reuse(fr, dfr, q);
+        }
+        return;
+    }
+
+    // vanilla_perm:
+    // (pi - p1*p2 + alpha_phi*D1*D2*D3 - alpha*N1*N2*N3) * fr
+    if (poly_id == 2) {
+        u32 pi, dpi, np1, dnp1, p2, dp2, aphi, daphi;
+        u32 D1, dD1, D2, dD2, D3, dD3;
+        u32 nN1, dnN1, N2, dN2, N3, dN3, fr, dfr;
+
+        load_vd_reuse(tables, len, 0, idx, half, q, pi, dpi);
+        load_vd_reuse(tables, len, 1, idx, half, q, np1, dnp1);
+        load_vd_reuse(tables, len, 2, idx, half, q, p2, dp2);
+        load_vd_reuse(tables, len, 3, idx, half, q, aphi, daphi);
+        load_vd_reuse(tables, len, 4, idx, half, q, D1, dD1);
+        load_vd_reuse(tables, len, 5, idx, half, q, D2, dD2);
+        load_vd_reuse(tables, len, 6, idx, half, q, D3, dD3);
+        load_vd_reuse(tables, len, 7, idx, half, q, nN1, dnN1);
+        load_vd_reuse(tables, len, 8, idx, half, q, N2, dN2);
+        load_vd_reuse(tables, len, 9, idx, half, q, N3, dN3);
+        load_vd_reuse(tables, len, 10, idx, half, q, fr, dfr);
+
+        for (int x = 0; x <= degree; ++x) {
+            u32 acc = 0;
+            acc = add_mod(acc, prod2(pi, fr, q), q);
+            acc = add_mod(acc, prod3(np1, p2, fr, q), q);
+            acc = add_mod(acc, prod5(aphi, D1, D2, D3, fr, q), q);
+            acc = add_mod(acc, prod4(nN1, N2, N3, fr, q), q);
+            out[x] = acc;
+
+            adv_reuse(pi, dpi, q);
+            adv_reuse(np1, dnp1, q);
+            adv_reuse(p2, dp2, q);
+            adv_reuse(aphi, daphi, q);
+            adv_reuse(D1, dD1, q);
+            adv_reuse(D2, dD2, q);
+            adv_reuse(D3, dD3, q);
+            adv_reuse(nN1, dnN1, q);
+            adv_reuse(N2, dN2, q);
+            adv_reuse(N3, dN3, q);
+            adv_reuse(fr, dfr, q);
+        }
+        return;
+    }
+
+    // opencheck_6: y1*k1 + ... + y6*k6
+    if (poly_id == 3) {
+        u32 v0, d0, v1, d1, v2, d2, v3, d3, v4, d4, v5, d5;
+
+        load_vd_reuse(tables, len, 0, idx, half, q, v0, d0);
+        load_vd_reuse(tables, len, 1, idx, half, q, v1, d1);
+        load_vd_reuse(tables, len, 2, idx, half, q, v2, d2);
+        load_vd_reuse(tables, len, 3, idx, half, q, v3, d3);
+        load_vd_reuse(tables, len, 4, idx, half, q, v4, d4);
+        load_vd_reuse(tables, len, 5, idx, half, q, v5, d5);
+
+        for (int x = 0; x <= degree; ++x) {
+            u32 acc = 0;
+            acc = add_mod(acc, v0, q);
+            acc = add_mod(acc, v1, q);
+            acc = add_mod(acc, v2, q);
+            acc = add_mod(acc, v3, q);
+            acc = add_mod(acc, v4, q);
+            acc = add_mod(acc, v5, q);
+            out[x] = acc;
+
+            adv_reuse(v0, d0, q);
+            adv_reuse(v1, d1, q);
+            adv_reuse(v2, d2, q);
+            adv_reuse(v3, d3, q);
+            adv_reuse(v4, d4, q);
+            adv_reuse(v5, d5, q);
+        }
+        return;
+    }
+
+    // degree_sweep_deg3/5/7:
+    // q1*w1 + q2*w2 + qH*w1^k*w2 + qC
+    if (poly_id == 5 || poly_id == 6 || poly_id == 7) {
+        u32 q1, dq1, w1, dw1, q2, dq2, w2, dw2, qH, dqH, qC, dqC;
+
+        load_vd_reuse(tables, len, 0, idx, half, q, q1, dq1);
+        load_vd_reuse(tables, len, 1, idx, half, q, w1, dw1);
+        load_vd_reuse(tables, len, 2, idx, half, q, q2, dq2);
+        load_vd_reuse(tables, len, 3, idx, half, q, w2, dw2);
+        load_vd_reuse(tables, len, 4, idx, half, q, qH, dqH);
+        load_vd_reuse(tables, len, 5, idx, half, q, qC, dqC);
+
+        for (int x = 0; x <= degree; ++x) {
+            u32 acc = 0;
+            acc = add_mod(acc, prod2(q1, w1, q), q);
+            acc = add_mod(acc, prod2(q2, w2, q), q);
+
+            if (poly_id == 5) {
+                acc = add_mod(acc, prod3(qH, w1, w2, q), q);
+            } else if (poly_id == 6) {
+                acc = add_mod(acc, prod5(qH, w1, w1, w1, w2, q), q);
+            } else {
+                acc = add_mod(acc, prod7(qH, w1, w1, w1, w1, w1, w2, q), q);
+            }
+
+            acc = add_mod(acc, qC, q);
+            out[x] = acc;
+
+            adv_reuse(q1, dq1, q);
+            adv_reuse(w1, dw1, q);
+            adv_reuse(q2, dq2, q);
+            adv_reuse(w2, dw2, q);
+            adv_reuse(qH, dqH, q);
+            adv_reuse(qC, dqC, q);
+        }
+        return;
+    }
+
+    // Fallback, mainly for unsupported/legacy ids.
+    for (int x = 0; x <= degree; ++x) {
+        out[x] = eval_poly_at_x(
+            tables,
+            len,
+            idx,
+            half,
+            poly_id,
+            static_cast<u32>(x),
+            q
+        );
     }
 }
 

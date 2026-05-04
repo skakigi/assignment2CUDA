@@ -1908,102 +1908,6 @@ void check_last_cuda(const char* label) {
 
 } // namespace hp_spec
 
-torch::Tensor sumcheck_hyperplonk_u32_cuda(
-    torch::Tensor eval_tables,
-    torch::Tensor challenges,
-    uint64_t modulus,
-    int64_t poly_id_64) {
-
-    using namespace hp_spec;
-
-    int poly_id = static_cast<int>(poly_id_64);
-    int degree = degree_for_poly(poly_id);
-    int rows = rows_for_poly(poly_id);
-
-    if (!eval_tables.is_cuda()) {
-        throw std::invalid_argument("eval_tables must be CUDA");
-    }
-    if (eval_tables.scalar_type() != torch::kUInt32) {
-        throw std::invalid_argument("eval_tables must be torch.uint32");
-    }
-    if (eval_tables.dim() != 2) {
-        throw std::invalid_argument("eval_tables must have shape (rows, N)");
-    }
-    if (eval_tables.size(0) < rows) {
-        throw std::invalid_argument("eval_tables has too few rows for requested poly_id");
-    }
-    if (!is_power_of_two_i64(eval_tables.size(1))) {
-        throw std::invalid_argument("N must be a power of two");
-    }
-    if (modulus > 0xffffffffULL) {
-        throw std::invalid_argument("sumcheck_hyperplonk_u32_cuda requires a u32 modulus");
-    }
-
-    const c10::cuda::CUDAGuard device_guard(eval_tables.device());
-
-    auto tables = eval_tables.narrow(0, 0, rows).contiguous();
-    auto rs = challenges.to(eval_tables.options().dtype(torch::kUInt32)).contiguous();
-
-    int initial_len = static_cast<int>(tables.size(1));
-    int rounds = log2_exact_i64(initial_len);
-
-    if (rs.dim() != 1 || rs.size(0) < rounds) {
-        throw std::invalid_argument("challenges must have shape at least (log2(N),)");
-    }
-
-    auto output = torch::empty({rounds, degree + 1}, tables.options());
-    auto current = tables;
-
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    u32 q = static_cast<u32>(modulus);
-
-    for (int round = 0; round < rounds; ++round) {
-        int len = static_cast<int>(current.size(1));
-        int half = len >> 1;
-        int blocks = std::min(MAX_BLOCKS, std::max(1, (half + THREADS - 1) / THREADS));
-
-        auto partials = torch::empty({blocks, degree + 1}, tables.options());
-        size_t shmem = static_cast<size_t>(degree + 1) * THREADS * sizeof(u32);
-
-        eval_kernel<<<blocks, THREADS, shmem, stream>>>(
-            reinterpret_cast<const u32*>(current.data_ptr<uint32_t>()),
-            len,
-            poly_id,
-            degree,
-            q,
-            reinterpret_cast<u32*>(partials.data_ptr<uint32_t>()));
-        check_last_cuda("hp_spec eval_kernel");
-
-        reduce_kernel<<<degree + 1, THREADS, 0, stream>>>(
-            reinterpret_cast<const u32*>(partials.data_ptr<uint32_t>()),
-            blocks,
-            degree,
-            q,
-            reinterpret_cast<u32*>(output[round].data_ptr<uint32_t>()));
-        check_last_cuda("hp_spec reduce_kernel");
-
-        if (round + 1 < rounds) {
-            auto next = torch::empty({rows, half}, tables.options());
-            int upd_blocks = std::min(
-                MAX_BLOCKS,
-                std::max(1, (rows * half + THREADS - 1) / THREADS));
-
-            update_kernel<<<upd_blocks, THREADS, 0, stream>>>(
-                reinterpret_cast<const u32*>(current.data_ptr<uint32_t>()),
-                rows,
-                len,
-                reinterpret_cast<const u32*>(rs.data_ptr<uint32_t>()),
-                round,
-                q,
-                reinterpret_cast<u32*>(next.data_ptr<uint32_t>()));
-            check_last_cuda("hp_spec update_kernel");
-
-            current = next;
-        }
-    }
-
-    return output;
-}
 
 
 
@@ -5723,9 +5627,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           &sumcheck_terms_full_mont_u32_cuda,
           "Experimental full Montgomery-domain generic u32 SumCheck");
 
-    m.def("sumcheck_hyperplonk_u32_cuda",
-          &sumcheck_hyperplonk_u32_cuda,
-          "Specialized u32 SumCheck for fixed HyperPlonk-style polynomial templates");
     m.def("sumcheck_hyperplonk_full_mont_u32_cuda",
           &sumcheck_hyperplonk_full_mont_u32_cuda,
           "Experimental full Montgomery-domain specialized u32 SumCheck");

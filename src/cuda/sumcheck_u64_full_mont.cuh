@@ -1088,6 +1088,122 @@ torch::Tensor sumcheck_hyperplonk_full_mont_u64_cuda(
 
 
 
+
+torch::Tensor sumcheck_hyperplonk_full_mont_u64_round_eval_cuda(
+    torch::Tensor eval_tables,
+    uint64_t modulus_hi,
+    uint64_t modulus_lo,
+    int64_t poly_id_64) {
+
+    using namespace mont_u64_exp;
+
+    if (modulus_hi != 0 || modulus_lo != Q64) {
+        throw std::invalid_argument(
+            "u64 specialized round eval currently requires q = 2^64 - 2^32 + 1"
+        );
+    }
+
+    int poly_id = static_cast<int>(poly_id_64);
+    int degree = degree_for_poly(poly_id);
+    int rows = rows_for_poly(poly_id);
+
+    if (!eval_tables.is_cuda()) {
+        throw std::invalid_argument("eval_tables must be CUDA");
+    }
+    if (eval_tables.scalar_type() != torch::kUInt64) {
+        throw std::invalid_argument("eval_tables must be torch.uint64");
+    }
+    if (eval_tables.dim() != 2) {
+        throw std::invalid_argument("eval_tables must have shape (rows, N)");
+    }
+    if (eval_tables.size(0) < rows) {
+        throw std::invalid_argument("eval_tables has too few rows for requested poly_id");
+    }
+    if (!hp_spec::is_power_of_two_i64(eval_tables.size(1))) {
+        throw std::invalid_argument("N must be a power of two");
+    }
+    if (eval_tables.size(1) < 2) {
+        throw std::invalid_argument("N must be at least 2 for a SumCheck round");
+    }
+
+    const c10::cuda::CUDAGuard device_guard(eval_tables.device());
+
+    auto normal_tables = eval_tables.narrow(0, 0, rows).contiguous();
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    int len = static_cast<int>(normal_tables.size(1));
+    int half = len >> 1;
+
+    auto current_mont = torch::empty_like(normal_tables);
+
+    int conv_threads = SUMCHECK_THREADS;
+    int conv_blocks_tables = std::min(
+        SUMCHECK_MAX_BLOCKS,
+        static_cast<int>(
+            std::max<int64_t>(
+                1,
+                (normal_tables.numel() + conv_threads - 1) / conv_threads
+            )
+        )
+    );
+
+    convert_to_mont_u64_kernel<<<conv_blocks_tables, conv_threads, 0, stream>>>(
+        reinterpret_cast<const u64*>(normal_tables.data_ptr<uint64_t>()),
+        static_cast<size_t>(normal_tables.numel()),
+        reinterpret_cast<u64*>(current_mont.data_ptr<uint64_t>()));
+    hp_spec::check_last_cuda("hashed u64 specialized round convert tables");
+
+    int blocks = std::min(
+        SUMCHECK_MAX_BLOCKS,
+        std::max(1, (half + SUMCHECK_THREADS - 1) / SUMCHECK_THREADS)
+    );
+
+    auto partials = torch::empty({blocks, degree + 1}, normal_tables.options());
+    auto output_mont = torch::empty({degree + 1}, normal_tables.options());
+
+    size_t shmem =
+        static_cast<size_t>(degree + 1) *
+        SUMCHECK_THREADS *
+        sizeof(u64);
+
+    eval_hyperplonk_sumcheck_u64_kernel<<<blocks, SUMCHECK_THREADS, shmem, stream>>>(
+        reinterpret_cast<const u64*>(current_mont.data_ptr<uint64_t>()),
+        len,
+        poly_id,
+        degree,
+        reinterpret_cast<u64*>(partials.data_ptr<uint64_t>()));
+    hp_spec::check_last_cuda("hashed u64 specialized round eval");
+
+    reduce_sumcheck_u64_kernel<<<degree + 1, SUMCHECK_THREADS, 0, stream>>>(
+        reinterpret_cast<const u64*>(partials.data_ptr<uint64_t>()),
+        blocks,
+        degree,
+        reinterpret_cast<u64*>(output_mont.data_ptr<uint64_t>()));
+    hp_spec::check_last_cuda("hashed u64 specialized round reduce");
+
+    auto output_normal = torch::empty_like(output_mont);
+
+    int conv_blocks_out = std::min(
+        SUMCHECK_MAX_BLOCKS,
+        static_cast<int>(
+            std::max<int64_t>(
+                1,
+                (output_mont.numel() + conv_threads - 1) / conv_threads
+            )
+        )
+    );
+
+    convert_from_mont_u64_kernel<<<conv_blocks_out, conv_threads, 0, stream>>>(
+        reinterpret_cast<const u64*>(output_mont.data_ptr<uint64_t>()),
+        static_cast<size_t>(output_mont.numel()),
+        reinterpret_cast<u64*>(output_normal.data_ptr<uint64_t>()));
+    hp_spec::check_last_cuda("hashed u64 specialized round convert output");
+
+    return output_normal;
+}
+
+
 // ============================================================================
 // Hashed-challenge support: u64 one-round generic full-Montgomery SumCheck.
 // These entrypoints allow a Python transcript driver to:

@@ -623,6 +623,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("sumcheck_terms_full_mont_u64_round_eval_cuda",
           &sumcheck_terms_full_mont_u64_round_eval_cuda,
           "One-round generic full Montgomery-domain u64 SumCheck evaluation");
+
+    m.def("sumcheck_hyperplonk_full_mont_u64_round_eval_cuda",
+          &sumcheck_hyperplonk_full_mont_u64_round_eval_cuda,
+          "Specialized full Montgomery-domain u64 single-round eval for hashed transcript");
+
     m.def("fold_full_mont_u64_cuda",
           &fold_full_mont_u64_cuda,
           "One-round full Montgomery-domain u64 MLE fold");

@@ -250,9 +250,18 @@ def _expr_to_terms_uploaded_base(expr: str):
 
 def sumcheck_terms_u32(eval_tables, challenges, modulus, term_offsets, term_vars):
     import torch
+
+    # Maintained u32 CUDA path: full Montgomery over the assignment 32-bit prime.
+    # The old arbitrary-modulus uploaded-base u32 implementation has been retired.
+    if int(modulus) != 4294967291:
+        raise ValueError(
+            "u32 CUDA SumCheck now requires modulus 4294967291 "
+            "(full-Montgomery assignment-prime path)"
+        )
+
     native = _try_import_native() or _try_jit_native()
-    if native is None or not hasattr(native, 'sumcheck_terms_u32_cuda'):
-        raise RuntimeError('native uploaded-base CUDA extension is unavailable')
+    if native is None or not hasattr(native, 'sumcheck_terms_full_mont_u32_cuda'):
+        raise RuntimeError('native full-Montgomery u32 CUDA extension is unavailable')
 
     if not _is_torch_tensor(eval_tables):
         tables = torch.as_tensor(eval_tables, device='cuda')
@@ -274,7 +283,7 @@ def sumcheck_terms_u32(eval_tables, challenges, modulus, term_offsets, term_vars
 
     offs = torch.as_tensor(term_offsets, dtype=torch.int32)
     vars_ = torch.as_tensor(term_vars, dtype=torch.int32)
-    claim0, round_evals = native.sumcheck_terms_u32_cuda(
+    claim0, round_evals = native.sumcheck_terms_full_mont_u32_cuda(
         tables, rs, offs, vars_, int(modulus)
     )
     return claim0, round_evals

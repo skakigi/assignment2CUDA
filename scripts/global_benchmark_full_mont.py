@@ -386,11 +386,15 @@ def write_fixed_section(f, title: str, meta_lines: list[str], headers: list[str]
     f.write("\n\n")
 
 
-def group_by_bits(rows):
+def group_by_config(rows):
     grouped = {}
     for row in rows:
-        grouped.setdefault(row.bits, []).append(row)
+        grouped.setdefault((row.bits, row.num_vars), []).append(row)
     return dict(sorted(grouped.items()))
+
+
+def section_label(prefix: str, bits: int, num_vars: int) -> str:
+    return f"{prefix} / bits={bits} / num_vars={num_vars}"
 
 
 def write_text_report(path: Path, unhashed: list[UnhashedRow], hashed: list[HashedRow]) -> None:
@@ -405,7 +409,8 @@ def write_text_report(path: Path, unhashed: list[UnhashedRow], hashed: list[Hash
             "generic_ms", "spec_ms", "speedup", "generic_p90", "spec_p90",
             "generic_Mpts/s", "spec_Mpts/s", "shape",
         ]
-        for bits, group in group_by_bits(unhashed).items():
+
+        for (bits, num_vars), group in group_by_config(unhashed).items():
             body = [
                 [
                     r.template, r.function, r.N, r.rows, r.terms, r.deg,
@@ -417,10 +422,10 @@ def write_text_report(path: Path, unhashed: list[UnhashedRow], hashed: list[Hash
             ]
             write_fixed_section(
                 f,
-                f"Unhashed / Paper Compare / bits={bits}",
+                section_label("Unhashed / Paper Compare", bits, num_vars),
                 [
                     f"bits: {bits}",
-                    f"num_vars: {group[0].num_vars}",
+                    f"num_vars: {num_vars}",
                     f"device: {group[0].device}",
                     f"backend: {group[0].backend}",
                 ],
@@ -435,29 +440,31 @@ def write_text_report(path: Path, unhashed: list[UnhashedRow], hashed: list[Hash
                 "generic_ms", "spec_ms", "speedup", "generic_p90", "spec_p90",
                 "generic_Mpts/s", "spec_Mpts/s", "sha3_prefix", "shape",
             ]
-            body = [
-                [
-                    r.template, r.function, r.N, r.rows, r.terms, r.deg,
-                    f"{r.generic_ms:.3f}", f"{r.spec_ms:.3f}", f"{r.speedup:.2f}x",
-                    f"{r.generic_p90:.3f}", f"{r.spec_p90:.3f}",
-                    f"{r.generic_mpts_s:.2f}", f"{r.spec_mpts_s:.2f}",
-                    r.transcript_prefix, r.shape,
+
+            for (bits, num_vars), group in group_by_config(hashed).items():
+                body = [
+                    [
+                        r.template, r.function, r.N, r.rows, r.terms, r.deg,
+                        f"{r.generic_ms:.3f}", f"{r.spec_ms:.3f}", f"{r.speedup:.2f}x",
+                        f"{r.generic_p90:.3f}", f"{r.spec_p90:.3f}",
+                        f"{r.generic_mpts_s:.2f}", f"{r.spec_mpts_s:.2f}",
+                        r.transcript_prefix, r.shape,
+                    ]
+                    for r in group
                 ]
-                for r in hashed
-            ]
-            write_fixed_section(
-                f,
-                "Hashed / SHA3 Transcript / bits=64",
-                [
-                    "bits: 64",
-                    f"num_vars: {hashed[0].num_vars}",
-                    f"device: {hashed[0].device}",
-                    f"backend: {hashed[0].backend}",
-                ],
-                hashed_headers,
-                body,
-                infer_widths(hashed_headers, body),
-            )
+                write_fixed_section(
+                    f,
+                    section_label("Hashed / SHA3 Transcript", bits, num_vars),
+                    [
+                        f"bits: {bits}",
+                        f"num_vars: {num_vars}",
+                        f"device: {group[0].device}",
+                        f"backend: {group[0].backend}",
+                    ],
+                    hashed_headers,
+                    body,
+                    infer_widths(hashed_headers, body),
+                )
 
 
 def md_escape(x: object) -> str:
@@ -483,10 +490,10 @@ def write_md(path: Path, unhashed: list[UnhashedRow], hashed: list[HashedRow]) -
     with path.open("w") as f:
         f.write("# Global Full-Montgomery SumCheck Benchmark\n\n")
 
-        for bits, group in group_by_bits(unhashed).items():
-            f.write(f"## Unhashed / Paper Compare / bits={bits}\n\n")
+        for (bits, num_vars), group in group_by_config(unhashed).items():
+            f.write(f"## Unhashed / Paper Compare / bits={bits} / num_vars={num_vars}\n\n")
             f.write(f"- bits: `{bits}`\n")
-            f.write(f"- num_vars: `{group[0].num_vars}`\n")
+            f.write(f"- num_vars: `{num_vars}`\n")
             f.write(f"- device: `{group[0].device}`\n")
             f.write(f"- backend: `{group[0].backend}`\n\n")
             write_table_md(
@@ -501,25 +508,26 @@ def write_md(path: Path, unhashed: list[UnhashedRow], hashed: list[HashedRow]) -
             )
 
         if hashed:
-            f.write("## Hashed / SHA3 Transcript / bits=64\n\n")
-            f.write("- bits: `64`\n")
-            f.write(f"- num_vars: `{hashed[0].num_vars}`\n")
-            f.write(f"- device: `{hashed[0].device}`\n")
-            f.write(f"- backend: `{hashed[0].backend}`\n\n")
-            write_table_md(
-                f,
-                [
-                    "template", "function", "N", "rows", "terms", "deg",
-                    "generic_ms", "spec_ms", "speedup", "generic_p90", "spec_p90",
-                    "generic_mpts_s", "spec_mpts_s", "transcript_prefix", "shape",
-                ],
-                [asdict(r) for r in hashed],
-                {
-                    "generic_mpts_s": "generic_Mpts/s",
-                    "spec_mpts_s": "spec_Mpts/s",
-                    "transcript_prefix": "sha3_prefix",
-                },
-            )
+            for (bits, num_vars), group in group_by_config(hashed).items():
+                f.write(f"## Hashed / SHA3 Transcript / bits={bits} / num_vars={num_vars}\n\n")
+                f.write(f"- bits: `{bits}`\n")
+                f.write(f"- num_vars: `{num_vars}`\n")
+                f.write(f"- device: `{group[0].device}`\n")
+                f.write(f"- backend: `{group[0].backend}`\n\n")
+                write_table_md(
+                    f,
+                    [
+                        "template", "function", "N", "rows", "terms", "deg",
+                        "generic_ms", "spec_ms", "speedup", "generic_p90", "spec_p90",
+                        "generic_mpts_s", "spec_mpts_s", "transcript_prefix", "shape",
+                    ],
+                    [asdict(r) for r in group],
+                    {
+                        "generic_mpts_s": "generic_Mpts/s",
+                        "spec_mpts_s": "spec_Mpts/s",
+                        "transcript_prefix": "sha3_prefix",
+                    },
+                )
 
 
 def write_csv(path: Path, rows: list[object]) -> None:
@@ -537,12 +545,12 @@ def write_csv(path: Path, rows: list[object]) -> None:
 def write_summary(path: Path, unhashed: list[UnhashedRow], hashed: list[HashedRow]) -> None:
     lines = ["# Global Benchmark Summary\n\n"]
 
-    for bits, group in group_by_bits(unhashed).items():
+    for (bits, num_vars), group in group_by_config(unhashed).items():
         speedups = [r.speedup for r in group]
         best = max(group, key=lambda r: r.speedup)
         worst = min(group, key=lambda r: r.speedup)
         lines += [
-            f"## Unhashed / bits={bits}\n\n",
+            f"## Unhashed / bits={bits} / num_vars={num_vars}\n\n",
             f"- rows: `{len(group)}`\n",
             f"- mean speedup: `{statistics.mean(speedups):.3f}x`\n",
             f"- median speedup: `{statistics.median(speedups):.3f}x`\n",
@@ -551,17 +559,18 @@ def write_summary(path: Path, unhashed: list[UnhashedRow], hashed: list[HashedRo
         ]
 
     if hashed:
-        speedups = [r.speedup for r in hashed]
-        best = max(hashed, key=lambda r: r.speedup)
-        worst = min(hashed, key=lambda r: r.speedup)
-        lines += [
-            "## Hashed / bits=64\n\n",
-            f"- rows: `{len(hashed)}`\n",
-            f"- mean speedup: `{statistics.mean(speedups):.3f}x`\n",
-            f"- median speedup: `{statistics.median(speedups):.3f}x`\n",
-            f"- best speedup: `{best.template}` `{best.speedup:.3f}x`\n",
-            f"- weakest speedup: `{worst.template}` `{worst.speedup:.3f}x`\n",
-        ]
+        for (bits, num_vars), group in group_by_config(hashed).items():
+            speedups = [r.speedup for r in group]
+            best = max(group, key=lambda r: r.speedup)
+            worst = min(group, key=lambda r: r.speedup)
+            lines += [
+                f"## Hashed / bits={bits} / num_vars={num_vars}\n\n",
+                f"- rows: `{len(group)}`\n",
+                f"- mean speedup: `{statistics.mean(speedups):.3f}x`\n",
+                f"- median speedup: `{statistics.median(speedups):.3f}x`\n",
+                f"- best speedup: `{best.template}` `{best.speedup:.3f}x`\n",
+                f"- weakest speedup: `{worst.template}` `{worst.speedup:.3f}x`\n\n",
+            ]
 
     path.write_text("".join(lines))
 
@@ -575,7 +584,7 @@ def plot_runtime(path: Path, unhashed: list[UnhashedRow], hashed: list[HashedRow
 
     path.mkdir(parents=True, exist_ok=True)
 
-    for bits, group in group_by_bits(unhashed).items():
+    for (bits, num_vars), group in group_by_config(unhashed).items():
         x = list(range(len(group)))
         width = 0.38
         labels = [r.template for r in group]
@@ -585,41 +594,43 @@ def plot_runtime(path: Path, unhashed: list[UnhashedRow], hashed: list[HashedRow
         plt.bar([i + width / 2 for i in x], [r.spec_ms for r in group], width, label="specialized")
         plt.xticks(x, labels, rotation=60, ha="right")
         plt.ylabel("ms")
-        plt.title(f"Unhashed / Paper Compare Runtime / bits={bits}")
+        plt.title(f"Unhashed / Paper Compare Runtime / bits={bits} / num_vars={num_vars}")
         plt.legend()
         plt.tight_layout()
-        plt.savefig(path / f"unhashed_runtime_bits{bits}.png", dpi=160)
+        plt.savefig(path / f"unhashed_runtime_bits{bits}_nv{num_vars}.png", dpi=160)
         plt.close()
 
         plt.figure(figsize=(16, 5))
         plt.bar(x, [r.speedup for r in group])
         plt.xticks(x, labels, rotation=60, ha="right")
         plt.ylabel("speedup (x)")
-        plt.title(f"Unhashed / Paper Compare Speedup / bits={bits}")
+        plt.title(f"Unhashed / Paper Compare Speedup / bits={bits} / num_vars={num_vars}")
         plt.tight_layout()
-        plt.savefig(path / f"unhashed_speedup_bits{bits}.png", dpi=160)
+        plt.savefig(path / f"unhashed_speedup_bits{bits}_nv{num_vars}.png", dpi=160)
         plt.close()
 
     if hashed:
-        x = list(range(len(hashed)))
-        labels = [r.template for r in hashed]
-        plt.figure(figsize=(16, 6))
-        width = 0.38
-        plt.bar([i - width / 2 for i in x], [r.generic_ms for r in hashed], width, label="generic")
-        plt.bar([i + width / 2 for i in x], [r.spec_ms for r in hashed], width, label="specialized")
-        plt.xticks(x, labels, rotation=60, ha="right")
-        plt.ylabel("ms")
-        plt.title("Hashed / SHA3 Transcript Runtime / bits=64")
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(path / "hashed_runtime_bits64.png", dpi=160)
-        plt.close()
+        for (bits, num_vars), group in group_by_config(hashed).items():
+            x = list(range(len(group)))
+            labels = [r.template for r in group]
+            width = 0.38
+
+            plt.figure(figsize=(16, 6))
+            plt.bar([i - width / 2 for i in x], [r.generic_ms for r in group], width, label="generic")
+            plt.bar([i + width / 2 for i in x], [r.spec_ms for r in group], width, label="specialized")
+            plt.xticks(x, labels, rotation=60, ha="right")
+            plt.ylabel("ms")
+            plt.title(f"Hashed / SHA3 Transcript Runtime / bits={bits} / num_vars={num_vars}")
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(path / f"hashed_runtime_bits{bits}_nv{num_vars}.png", dpi=160)
+            plt.close()
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--bits", default="64", help="32, 64, 128, comma-list, or all")
-    ap.add_argument("--num-vars", type=int, default=20)
+    ap.add_argument("--num-vars", default="20", help="single value or comma-list")
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--runs", type=int, default=10)
     ap.add_argument("--polys", default=",".join(DEFAULT_POLYS))
@@ -635,13 +646,14 @@ def main() -> None:
     raw_dir.mkdir(parents=True, exist_ok=True)
 
     unhashed_raw, unhashed = run_unhashed(args, args.polys)
-    safe_bits = args.bits.replace(",", "_")
-    (raw_dir / f"global_unhashed_bits{safe_bits}_nv{args.num_vars}.txt").write_text(unhashed_raw)
+    safe_bits = str(args.bits).replace(",", "_")
+    safe_num_vars = str(args.num_vars).replace(",", "_")
+    (raw_dir / f"global_unhashed_bits{safe_bits}_nv{safe_num_vars}.txt").write_text(unhashed_raw)
 
     hashed: list[HashedRow] = []
     if args.include_hashed:
         hashed_raw, hashed = run_hashed(args, args.polys)
-        (raw_dir / f"global_hashed_bits64_nv{args.num_vars}.txt").write_text(hashed_raw)
+        (raw_dir / f"global_hashed_bits64_nv{safe_num_vars}.txt").write_text(hashed_raw)
 
     write_csv(args.out_dir / "global_benchmark_unhashed.csv", unhashed)
     if hashed:

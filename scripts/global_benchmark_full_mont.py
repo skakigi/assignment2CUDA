@@ -32,6 +32,22 @@ DEFAULT_POLYS = [
     "degree_sweep_deg7",
 ]
 
+SCALING_POLYS = [
+    "baseline_mul",
+    "vanilla_gate",
+    "vanilla_perm",
+]
+
+PLOT_STANDARD_BITS = 64
+PLOT_STANDARD_NUM_VARS = 16
+PLOT_NUM_VARS_VALUES = [12, 16, 20]
+PLOT_REPRESENTATIVE_POLYS = [
+    "baseline_mul",
+    "vanilla_gate",
+    "vanilla_perm",
+]
+
+
 TEMPLATE_META = {
     "baseline_linear": ("a", 1, 1),
     "baseline_mul": ("a*b", 2, 1),
@@ -575,59 +591,191 @@ def write_summary(path: Path, unhashed: list[UnhashedRow], hashed: list[HashedRo
     path.write_text("".join(lines))
 
 
-def plot_runtime(path: Path, unhashed: list[UnhashedRow], hashed: list[HashedRow]) -> None:
+
+def median_runtime_pair(rows) -> tuple[float, float]:
+    generic = [r.generic_ms for r in rows]
+    spec = [r.spec_ms for r in rows]
+    if not generic or not spec:
+        return 0.0, 0.0
+    return statistics.median(generic), statistics.median(spec)
+
+
+def clear_old_plots(path: Path) -> None:
+    """Keep report plots intentional by removing stale benchmark plots first."""
+    if not path.exists():
+        return
+    for pattern in [
+        "unhashed_runtime_bits*.png",
+        "unhashed_speedup_bits*.png",
+        "hashed_runtime_bits*.png",
+        "scaling_*.png",
+        "specialized_functions_bits*.png",
+        "representative_scaling_*.png",
+        "generic_vs_specialized_bits*.png",
+    ]:
+        for old in path.glob(pattern):
+            old.unlink()
+
+
+def plot_benchmark_figures(path: Path, unhashed: list[UnhashedRow], hashed: list[HashedRow]) -> None:
     try:
         import matplotlib.pyplot as plt
     except Exception as e:
-        print(f"plot skipped: {e}")
+        print(f"plots skipped: {e}")
         return
 
     path.mkdir(parents=True, exist_ok=True)
+    clear_old_plots(path)
 
-    for (bits, num_vars), group in group_by_config(unhashed).items():
-        x = list(range(len(group)))
+    standard_bits = PLOT_STANDARD_BITS
+    standard_num_vars = PLOT_STANDARD_NUM_VARS
+    rep_polys = PLOT_REPRESENTATIVE_POLYS
+    plot_num_vars_values = PLOT_NUM_VARS_VALUES
+
+    standard_rows = [
+        r for r in unhashed
+        if r.bits == standard_bits and r.num_vars == standard_num_vars
+    ]
+
+    # 1) Function comparison at medium size: specialized only.
+    if standard_rows:
+        ordered = sorted(standard_rows, key=lambda r: r.spec_ms)
+        x = list(range(len(ordered)))
+        labels = [r.template for r in ordered]
+
+        plt.figure(figsize=(13, 5.5))
+        plt.bar(x, [r.spec_ms for r in ordered])
+        plt.xticks(x, labels, rotation=55, ha="right")
+        plt.ylabel("specialized runtime (ms)")
+        plt.title(
+            f"Specialized runtime by function / bits={standard_bits} / num_vars={standard_num_vars}"
+        )
+        plt.tight_layout()
+        plt.savefig(
+            path / f"specialized_functions_bits{standard_bits}_nv{standard_num_vars}.png",
+            dpi=160,
+        )
+        plt.close()
+
+    # 2) Representative functions scaling over bit size at standard num_vars.
+    bits_values = sorted({
+        r.bits for r in unhashed
+        if r.num_vars == standard_num_vars and r.template in rep_polys
+    })
+
+    if len(bits_values) >= 2:
+        plt.figure(figsize=(8.5, 5.2))
+        plotted = False
+
+        for template in rep_polys:
+            xs = []
+            ys = []
+            for bits in bits_values:
+                match = next(
+                    (
+                        r for r in unhashed
+                        if r.bits == bits
+                        and r.num_vars == standard_num_vars
+                        and r.template == template
+                    ),
+                    None,
+                )
+                if match is None:
+                    continue
+                xs.append(bits)
+                ys.append(match.spec_ms)
+
+            if len(xs) >= 2:
+                plt.plot(xs, ys, marker="o", label=template)
+                plotted = True
+
+        if plotted:
+            plt.xlabel("field bit width")
+            plt.ylabel("specialized runtime (ms)")
+            plt.title(f"Representative specialized scaling vs bit width / num_vars={standard_num_vars}")
+            plt.xticks(bits_values)
+            plt.legend(fontsize="small")
+            plt.tight_layout()
+            plt.savefig(
+                path / f"representative_scaling_bits_nv{standard_num_vars}.png",
+                dpi=160,
+            )
+        plt.close()
+
+    # 3) Representative functions scaling over num_vars at standard bit width.
+    available_num_vars = sorted({
+        r.num_vars for r in unhashed
+        if r.bits == standard_bits and r.template in rep_polys
+    })
+    selected_num_vars = [nv for nv in plot_num_vars_values if nv in available_num_vars]
+    if len(selected_num_vars) < 2:
+        selected_num_vars = available_num_vars
+
+    if len(selected_num_vars) >= 2:
+        plt.figure(figsize=(8.5, 5.2))
+        plotted = False
+
+        for template in rep_polys:
+            xs = []
+            ys = []
+            for num_vars in selected_num_vars:
+                match = next(
+                    (
+                        r for r in unhashed
+                        if r.bits == standard_bits
+                        and r.num_vars == num_vars
+                        and r.template == template
+                    ),
+                    None,
+                )
+                if match is None:
+                    continue
+                xs.append(num_vars)
+                ys.append(match.spec_ms)
+
+            if len(xs) >= 2:
+                plt.plot(xs, ys, marker="o", label=template)
+                plotted = True
+
+        if plotted:
+            plt.xlabel("num_vars")
+            plt.ylabel("specialized runtime (ms)")
+            plt.title(f"Representative specialized scaling vs num_vars / bits={standard_bits}")
+            plt.xticks(selected_num_vars)
+            plt.legend(fontsize="small")
+            plt.tight_layout()
+            plt.savefig(
+                path / f"representative_scaling_num_vars_bits{standard_bits}.png",
+                dpi=160,
+            )
+        plt.close()
+
+    # 4) Generic vs specialized runtime across all tests at median size.
+    if standard_rows:
+        ordered = sorted(standard_rows, key=lambda r: r.template)
+        x = list(range(len(ordered)))
         width = 0.38
-        labels = [r.template for r in group]
+        labels = [r.template for r in ordered]
 
-        plt.figure(figsize=(16, 6))
-        plt.bar([i - width / 2 for i in x], [r.generic_ms for r in group], width, label="generic")
-        plt.bar([i + width / 2 for i in x], [r.spec_ms for r in group], width, label="specialized")
-        plt.xticks(x, labels, rotation=60, ha="right")
-        plt.ylabel("ms")
-        plt.title(f"Unhashed / Paper Compare Runtime / bits={bits} / num_vars={num_vars}")
+        plt.figure(figsize=(14, 5.8))
+        plt.bar([i - width / 2 for i in x], [r.generic_ms for r in ordered], width, label="generic")
+        plt.bar([i + width / 2 for i in x], [r.spec_ms for r in ordered], width, label="specialized")
+        plt.xticks(x, labels, rotation=55, ha="right")
+        plt.ylabel("runtime (ms)")
+        plt.title(f"Generic vs specialized runtime / bits={standard_bits} / num_vars={standard_num_vars}")
         plt.legend()
         plt.tight_layout()
-        plt.savefig(path / f"unhashed_runtime_bits{bits}_nv{num_vars}.png", dpi=160)
+        plt.savefig(
+            path / f"generic_vs_specialized_bits{standard_bits}_nv{standard_num_vars}.png",
+            dpi=160,
+        )
         plt.close()
-
-        plt.figure(figsize=(16, 5))
-        plt.bar(x, [r.speedup for r in group])
-        plt.xticks(x, labels, rotation=60, ha="right")
-        plt.ylabel("speedup (x)")
-        plt.title(f"Unhashed / Paper Compare Speedup / bits={bits} / num_vars={num_vars}")
-        plt.tight_layout()
-        plt.savefig(path / f"unhashed_speedup_bits{bits}_nv{num_vars}.png", dpi=160)
-        plt.close()
-
-    if hashed:
-        for (bits, num_vars), group in group_by_config(hashed).items():
-            x = list(range(len(group)))
-            labels = [r.template for r in group]
-            width = 0.38
-
-            plt.figure(figsize=(16, 6))
-            plt.bar([i - width / 2 for i in x], [r.generic_ms for r in group], width, label="generic")
-            plt.bar([i + width / 2 for i in x], [r.spec_ms for r in group], width, label="specialized")
-            plt.xticks(x, labels, rotation=60, ha="right")
-            plt.ylabel("ms")
-            plt.title(f"Hashed / SHA3 Transcript Runtime / bits={bits} / num_vars={num_vars}")
-            plt.legend()
-            plt.tight_layout()
-            plt.savefig(path / f"hashed_runtime_bits{bits}_nv{num_vars}.png", dpi=160)
-            plt.close()
 
 
 def main() -> None:
+    global PLOT_STANDARD_BITS, PLOT_STANDARD_NUM_VARS
+    global PLOT_NUM_VARS_VALUES, PLOT_REPRESENTATIVE_POLYS
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--bits", default="64", help="32, 64, 128, comma-list, or all")
     ap.add_argument("--num-vars", default="20", help="single value or comma-list")
@@ -639,7 +787,25 @@ def main() -> None:
     ap.add_argument("--include-hashed", action="store_true", help="Run u64 SHA3 transcript benchmark section")
     ap.add_argument("--out-dir", type=Path, default=ROOT / "reports")
     ap.add_argument("--no-plot", action="store_true")
+    ap.add_argument("--plot-standard-bits", type=int, default=PLOT_STANDARD_BITS)
+    ap.add_argument("--plot-standard-num-vars", type=int, default=PLOT_STANDARD_NUM_VARS)
+    ap.add_argument("--plot-num-vars-values", default=",".join(str(x) for x in PLOT_NUM_VARS_VALUES))
+    ap.add_argument("--plot-polys", default=",".join(PLOT_REPRESENTATIVE_POLYS))
     args = ap.parse_args()
+
+    PLOT_STANDARD_BITS = int(args.plot_standard_bits)
+    PLOT_STANDARD_NUM_VARS = int(args.plot_standard_num_vars)
+    PLOT_NUM_VARS_VALUES = [
+        int(x.strip())
+        for x in str(args.plot_num_vars_values).split(",")
+        if x.strip()
+    ]
+    PLOT_REPRESENTATIVE_POLYS = [
+        x.strip()
+        for x in str(args.plot_polys).split(",")
+        if x.strip()
+    ]
+
 
     raw_dir = args.out_dir / "raw"
     plot_dir = args.out_dir / "plots"
@@ -664,7 +830,7 @@ def main() -> None:
     write_summary(args.out_dir / "global_benchmark_summary.md", unhashed, hashed)
 
     if not args.no_plot:
-        plot_runtime(plot_dir, unhashed, hashed)
+        plot_benchmark_figures(plot_dir, unhashed, hashed)
 
     print(f"wrote markdown: {args.out_dir / 'global_benchmark.md'}")
     print(f"wrote text:     {args.out_dir / 'global_benchmark.txt'}")

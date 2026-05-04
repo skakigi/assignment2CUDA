@@ -17,6 +17,9 @@ import numpy as np
 
 from src.sumcheck_cpu_reference import FIELD_MODULUS, sumcheck_reference
 
+# Maintained CUDA u32 path uses the assignment 32-bit prime.
+U32_FIELD_MODULUS = 4294967291
+
 _NATIVE = None
 _NATIVE_LOAD_ERROR: Optional[BaseException] = None
 
@@ -173,15 +176,8 @@ def native_status() -> str:
     return f"native extension unavailable: {_NATIVE_LOAD_ERROR}"
 
 
-_EXPR_TO_ID = {
-    "a": 0,
-    "a*b": 1,
-    "a*b + c": 2,
-    "a*b+c": 2,
-    "a*b*c": 3,
-}
 
-def _expr_to_terms_uploaded_base(expr: str):
+def _expr_to_terms_u32(expr: str):
     expr = expr.replace(' ', '')
     if expr == 'a':
         return [0, 1], [0]
@@ -198,10 +194,10 @@ def sumcheck_terms_u32(eval_tables, challenges, modulus, term_offsets, term_vars
     import torch
 
     # Maintained u32 CUDA path: full Montgomery over the assignment 32-bit prime.
-    # The old arbitrary-modulus uploaded-base u32 implementation has been retired.
-    if int(modulus) != 4294967291:
+    # The old arbitrary-modulus u32 implementation has been retired.
+    if int(modulus) != U32_FIELD_MODULUS:
         raise ValueError(
-            "u32 CUDA SumCheck now requires modulus 4294967291 "
+            f"u32 CUDA SumCheck now requires modulus {U32_FIELD_MODULUS} "
             "(full-Montgomery assignment-prime path)"
         )
 
@@ -236,8 +232,12 @@ def sumcheck_terms_u32(eval_tables, challenges, modulus, term_offsets, term_vars
 
 
 def sumcheck_expr(eval_tables, challenges, modulus=None, expr: str = 'a*b'):
-    # Preserve the benchmark-facing API: return round_evals only.
-    p = int(FIELD_MODULUS if modulus is None else modulus)
-    offs, vars_ = _expr_to_terms_uploaded_base(expr)
+    """Compute round evaluations for small expression-template u32 SumCheck.
+
+    This benchmark-facing helper uses the maintained full-Montgomery u32 CUDA
+    path, whose supported field is the assignment 32-bit prime.
+    """
+    p = int(U32_FIELD_MODULUS if modulus is None else modulus)
+    offs, vars_ = _expr_to_terms_u32(expr)
     _claim0, round_evals = sumcheck_terms_u32(eval_tables, challenges, p, offs, vars_)
-    return round_evals   
+    return round_evals

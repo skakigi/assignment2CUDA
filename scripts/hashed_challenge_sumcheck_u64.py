@@ -1,5 +1,6 @@
 import argparse
 import hashlib
+import math
 import statistics
 import sys
 
@@ -73,12 +74,13 @@ def time_call(fn):
     return start.elapsed_time(end), out
 
 
-def run_hashed(poly, num_vars, seed, check=True):
+def run_hashed_backend(poly, num_vars, seed, backend, check=True):
     terms = base.POLYS[poly]
     offsets, flat = flatten_terms(terms)
 
     term_offsets = torch.tensor(offsets, dtype=torch.int32)
     term_vars = torch.tensor(flat, dtype=torch.int32)
+    poly_id = int(base.POLY_IDS[poly])
 
     current = make_inputs(poly, num_vars, seed)
     original = current.clone()
@@ -97,15 +99,25 @@ def run_hashed(poly, num_vars, seed, check=True):
     total_fold_ms = 0.0
 
     for round_idx in range(num_vars):
-        eval_ms, round_evals = time_call(
-            lambda: sumcheck_cuda_ext.sumcheck_terms_full_mont_u64_round_eval_cuda(
+        if backend == "generic":
+            eval_fn = lambda: sumcheck_cuda_ext.sumcheck_terms_full_mont_u64_round_eval_cuda(
                 current,
                 term_offsets,
                 term_vars,
                 0,
                 Q64,
             )
-        )
+        elif backend == "specialized":
+            eval_fn = lambda: sumcheck_cuda_ext.sumcheck_hyperplonk_full_mont_u64_round_eval_cuda(
+                current,
+                0,
+                Q64,
+                poly_id,
+            )
+        else:
+            raise ValueError(f"unknown backend {backend!r}")
+
+        eval_ms, round_evals = time_call(eval_fn)
         total_eval_ms += eval_ms
 
         round_cpu = round_evals.detach().cpu().numpy()
@@ -131,19 +143,28 @@ def run_hashed(poly, num_vars, seed, check=True):
     chals = torch.tensor(challenges, dtype=torch.uint64, device="cuda")
 
     if check:
-        _claim, ref = sumcheck_cuda_ext.sumcheck_terms_full_mont_u64_cuda(
-            original,
-            chals,
-            term_offsets,
-            term_vars,
-            0,
-            Q64,
-        )
+        if backend == "generic":
+            _claim, ref = sumcheck_cuda_ext.sumcheck_terms_full_mont_u64_cuda(
+                original,
+                chals,
+                term_offsets,
+                term_vars,
+                0,
+                Q64,
+            )
+        else:
+            ref = sumcheck_cuda_ext.sumcheck_hyperplonk_full_mont_u64_cuda(
+                original,
+                chals,
+                0,
+                Q64,
+                poly_id,
+            )
 
         if not torch.equal(out.detach().cpu(), ref.detach().cpu()):
             diff = (out.detach().cpu() != ref.detach().cpu()).nonzero()[0].tolist()
             raise AssertionError(
-                f"hashed-vs-full mismatch poly={poly} nv={num_vars} first={diff}"
+                f"hashed-vs-full mismatch backend={backend} poly={poly} nv={num_vars} first={diff}"
             )
 
     return {
@@ -156,21 +177,58 @@ def run_hashed(poly, num_vars, seed, check=True):
     }
 
 
-def bench(poly, num_vars, seed, warmup, runs, check):
+def percentile_nearest_rank(values, percentile):
+    ordered = sorted(values)
+    if not ordered:
+        return 0.0
+    idx = max(0, min(len(ordered) - 1, math.ceil(percentile * len(ordered)) - 1))
+    return ordered[idx]
+
+
+def bench_backend(poly, num_vars, seed, warmup, runs, check, backend):
     for _ in range(warmup):
-        run_hashed(poly, num_vars, seed, check=check)
+        run_hashed_backend(poly, num_vars, seed, backend=backend, check=check)
 
     times = []
     last = None
     for _ in range(runs):
-        result = run_hashed(poly, num_vars, seed, check=check)
+        result = run_hashed_backend(poly, num_vars, seed, backend=backend, check=check)
         times.append(result["total_ms"])
         last = result
 
     return {
         "median_ms": statistics.median(times),
-        "p90_ms": sorted(times)[int(0.9 * (len(times) - 1))],
+        "p90_ms": percentile_nearest_rank(times, 0.90),
         "last": last,
+    }
+
+
+def bench(poly, num_vars, seed, warmup, runs, check):
+    generic = bench_backend(poly, num_vars, seed, warmup, runs, check, "generic")
+    spec = bench_backend(poly, num_vars, seed, warmup, runs, check, "specialized")
+
+    g_last = generic["last"]
+    s_last = spec["last"]
+
+    if not torch.equal(g_last["out"].detach().cpu(), s_last["out"].detach().cpu()):
+        diff = (g_last["out"].detach().cpu() != s_last["out"].detach().cpu()).nonzero()[0].tolist()
+        raise AssertionError(
+            f"generic-vs-specialized hashed output mismatch poly={poly} nv={num_vars} first={diff}"
+        )
+
+    if g_last["challenges"] != s_last["challenges"]:
+        raise AssertionError(f"generic-vs-specialized challenge mismatch poly={poly} nv={num_vars}")
+
+    if g_last["transcript"] != s_last["transcript"]:
+        raise AssertionError(f"generic-vs-specialized transcript mismatch poly={poly} nv={num_vars}")
+
+    return {
+        "generic_ms": generic["median_ms"],
+        "spec_ms": spec["median_ms"],
+        "speedup": generic["median_ms"] / spec["median_ms"] if spec["median_ms"] > 0 else 0.0,
+        "generic_p90": generic["p90_ms"],
+        "spec_p90": spec["p90_ms"],
+        "last": g_last,
     }
 
 
@@ -192,10 +250,16 @@ def main():
     ap.add_argument("--check", action="store_true")
     args = ap.parse_args()
 
-    if not hasattr(sumcheck_cuda_ext, "sumcheck_terms_full_mont_u64_round_eval_cuda"):
-        raise RuntimeError("missing round eval entrypoint")
-    if not hasattr(sumcheck_cuda_ext, "fold_full_mont_u64_cuda"):
-        raise RuntimeError("missing fold entrypoint")
+    required = [
+        "sumcheck_terms_full_mont_u64_round_eval_cuda",
+        "sumcheck_hyperplonk_full_mont_u64_round_eval_cuda",
+        "fold_full_mont_u64_cuda",
+        "sumcheck_terms_full_mont_u64_cuda",
+        "sumcheck_hyperplonk_full_mont_u64_cuda",
+    ]
+    for name in required:
+        if not hasattr(sumcheck_cuda_ext, name):
+            raise RuntimeError(f"missing required entrypoint: {name}")
 
     num_vars_list = [int(x) for x in args.num_vars.split(",")]
 
@@ -206,7 +270,7 @@ def main():
 
     print("device:", torch.cuda.get_device_name())
     print("challenge mode: SHA3-256 transcript between SumCheck rounds")
-    print("backend: u64 full Montgomery round eval + fold")
+    print("backend: u64 full Montgomery generic/spec round eval + fold")
     print()
 
     headers = [
@@ -215,12 +279,14 @@ def main():
         "num_vars",
         "N",
         "deg",
-        "median_ms",
-        "p90_ms",
-        "first_chal",
-        "transcript_prefix",
+        "generic_ms",
+        "spec_ms",
+        "speedup",
+        "generic_p90",
+        "spec_p90",
+        "sha3_prefix",
     ]
-    widths = [24, 64, 8, 10, 4, 10, 10, 20, 18]
+    widths = [24, 64, 8, 10, 4, 12, 10, 8, 12, 10, 18]
 
     for nv in num_vars_list:
         print()
@@ -249,9 +315,11 @@ def main():
                 f"{nv:d}",
                 f"{1 << nv:d}",
                 f"{base.degree_for_terms(terms):d}",
-                f"{result['median_ms']:.3f}",
-                f"{result['p90_ms']:.3f}",
-                str(last["challenges"][0]),
+                f"{result['generic_ms']:.3f}",
+                f"{result['spec_ms']:.3f}",
+                f"{result['speedup']:.2f}x",
+                f"{result['generic_p90']:.3f}",
+                f"{result['spec_p90']:.3f}",
                 last["transcript"][:16],
             ]
             print(fmt_row(row, widths))

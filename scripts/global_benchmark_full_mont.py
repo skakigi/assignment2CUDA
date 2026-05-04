@@ -84,9 +84,13 @@ class HashedRow:
     rows: int
     terms: int
     deg: int
-    median_ms: float
-    p90_ms: float
-    mpts_s: float
+    generic_ms: float
+    spec_ms: float
+    speedup: float
+    generic_p90: float
+    spec_p90: float
+    generic_mpts_s: float
+    spec_mpts_s: float
     first_chal: str
     transcript_prefix: str
     shape: str
@@ -299,7 +303,7 @@ def run_hashed(args: argparse.Namespace, polys: str) -> tuple[str, list[HashedRo
     raw = run_cmd(cmd)
     run_meta, parsed = parse_pipe_tables_by_bits(
         "bits = 64\n" + raw,
-        {"poly", "function", "n", "deg", "median_ms", "p90_ms"},
+        {"poly", "function", "n", "deg", "generic_ms", "spec_ms"},
     )
 
     rows: list[HashedRow] = []
@@ -309,15 +313,17 @@ def run_hashed(args: argparse.Namespace, polys: str) -> tuple[str, list[HashedRo
 
         N = inum(rec.get("n"))
         deg = inum(rec.get("deg"))
-        median_ms = fnum(rec.get("median_ms"))
-        p90_ms = fnum(rec.get("p90_ms"))
+        generic_ms = fnum(rec.get("generic_ms"))
+        spec_ms = fnum(rec.get("spec_ms"))
+        generic_p90 = fnum(rec.get("generic_p90"))
+        spec_p90 = fnum(rec.get("spec_p90"))
         num_vars = inum(meta.get("num_vars"), inum(run_meta.get("num_vars")))
 
         rows.append(
             HashedRow(
                 bits=64,
                 device=str(meta.get("device", run_meta.get("device", "unknown"))),
-                backend=str(meta.get("backend", run_meta.get("backend", "u64 full Montgomery round eval + fold"))),
+                backend=str(meta.get("backend", run_meta.get("backend", "u64 full Montgomery generic/spec round eval + fold"))),
                 num_vars=num_vars,
                 template=template,
                 function=str(rec.get("function", function)),
@@ -325,11 +331,15 @@ def run_hashed(args: argparse.Namespace, polys: str) -> tuple[str, list[HashedRo
                 rows=default_rows,
                 terms=default_terms,
                 deg=deg,
-                median_ms=median_ms,
-                p90_ms=p90_ms,
-                mpts_s=mpts(N, median_ms),
+                generic_ms=generic_ms,
+                spec_ms=spec_ms,
+                speedup=fnum(rec.get("speedup"), generic_ms / spec_ms if spec_ms > 0 else 0.0),
+                generic_p90=generic_p90,
+                spec_p90=spec_p90,
+                generic_mpts_s=mpts(N, generic_ms),
+                spec_mpts_s=mpts(N, spec_ms),
                 first_chal=str(rec.get("first_chal", "")),
-                transcript_prefix=str(rec.get("transcript_prefix", "")),
+                transcript_prefix=str(rec.get("transcript_prefix", rec.get("sha3_prefix", ""))),
                 shape=f"({num_vars}, {deg + 1})",
             )
         )
@@ -352,6 +362,15 @@ def fmt_fixed_row(values: list[object], widths: list[int]) -> str:
 
 def fmt_fixed_sep(widths: list[int]) -> str:
     return "-+-".join("-" * w for w in widths)
+
+
+def infer_widths(headers: list[str], rows: list[list[object]], padding: int = 0) -> list[int]:
+    widths = []
+    for idx, header in enumerate(headers):
+        values = [str(header)]
+        values.extend(str(row[idx]) for row in rows)
+        widths.append(max(len(v) for v in values) + padding)
+    return widths
 
 
 def write_fixed_section(f, title: str, meta_lines: list[str], headers: list[str], rows: list[list[object]], widths: list[int]) -> None:
@@ -386,8 +405,6 @@ def write_text_report(path: Path, unhashed: list[UnhashedRow], hashed: list[Hash
             "generic_ms", "spec_ms", "speedup", "generic_p90", "spec_p90",
             "generic_Mpts/s", "spec_Mpts/s", "shape",
         ]
-        unhashed_widths = [24, 68, 10, 5, 5, 4, 12, 10, 8, 12, 10, 15, 13, 12]
-
         for bits, group in group_by_bits(unhashed).items():
             body = [
                 [
@@ -409,22 +426,22 @@ def write_text_report(path: Path, unhashed: list[UnhashedRow], hashed: list[Hash
                 ],
                 unhashed_headers,
                 body,
-                unhashed_widths,
+                infer_widths(unhashed_headers, body),
             )
 
         if hashed:
             hashed_headers = [
                 "template", "function", "N", "rows", "terms", "deg",
-                "median_ms", "p90_ms", "Mpts/s", "first_chal",
-                "transcript_prefix", "shape",
+                "generic_ms", "spec_ms", "speedup", "generic_p90", "spec_p90",
+                "generic_Mpts/s", "spec_Mpts/s", "sha3_prefix", "shape",
             ]
-            hashed_widths = [24, 68, 10, 5, 5, 4, 10, 10, 10, 20, 18, 12]
-
             body = [
                 [
                     r.template, r.function, r.N, r.rows, r.terms, r.deg,
-                    f"{r.median_ms:.3f}", f"{r.p90_ms:.3f}", f"{r.mpts_s:.2f}",
-                    r.first_chal, r.transcript_prefix, r.shape,
+                    f"{r.generic_ms:.3f}", f"{r.spec_ms:.3f}", f"{r.speedup:.2f}x",
+                    f"{r.generic_p90:.3f}", f"{r.spec_p90:.3f}",
+                    f"{r.generic_mpts_s:.2f}", f"{r.spec_mpts_s:.2f}",
+                    r.transcript_prefix, r.shape,
                 ]
                 for r in hashed
             ]
@@ -439,7 +456,7 @@ def write_text_report(path: Path, unhashed: list[UnhashedRow], hashed: list[Hash
                 ],
                 hashed_headers,
                 body,
-                hashed_widths,
+                infer_widths(hashed_headers, body),
             )
 
 
@@ -493,11 +510,15 @@ def write_md(path: Path, unhashed: list[UnhashedRow], hashed: list[HashedRow]) -
                 f,
                 [
                     "template", "function", "N", "rows", "terms", "deg",
-                    "median_ms", "p90_ms", "mpts_s", "first_chal",
-                    "transcript_prefix", "shape",
+                    "generic_ms", "spec_ms", "speedup", "generic_p90", "spec_p90",
+                    "generic_mpts_s", "spec_mpts_s", "transcript_prefix", "shape",
                 ],
                 [asdict(r) for r in hashed],
-                {"mpts_s": "Mpts/s"},
+                {
+                    "generic_mpts_s": "generic_Mpts/s",
+                    "spec_mpts_s": "spec_Mpts/s",
+                    "transcript_prefix": "sha3_prefix",
+                },
             )
 
 
@@ -530,12 +551,16 @@ def write_summary(path: Path, unhashed: list[UnhashedRow], hashed: list[HashedRo
         ]
 
     if hashed:
-        medians = [r.median_ms for r in hashed]
+        speedups = [r.speedup for r in hashed]
+        best = max(hashed, key=lambda r: r.speedup)
+        worst = min(hashed, key=lambda r: r.speedup)
         lines += [
             "## Hashed / bits=64\n\n",
             f"- rows: `{len(hashed)}`\n",
-            f"- mean median_ms: `{statistics.mean(medians):.3f}`\n",
-            f"- median median_ms: `{statistics.median(medians):.3f}`\n",
+            f"- mean speedup: `{statistics.mean(speedups):.3f}x`\n",
+            f"- median speedup: `{statistics.median(speedups):.3f}x`\n",
+            f"- best speedup: `{best.template}` `{best.speedup:.3f}x`\n",
+            f"- weakest speedup: `{worst.template}` `{worst.speedup:.3f}x`\n",
         ]
 
     path.write_text("".join(lines))
@@ -579,10 +604,13 @@ def plot_runtime(path: Path, unhashed: list[UnhashedRow], hashed: list[HashedRow
         x = list(range(len(hashed)))
         labels = [r.template for r in hashed]
         plt.figure(figsize=(16, 6))
-        plt.bar(x, [r.median_ms for r in hashed])
+        width = 0.38
+        plt.bar([i - width / 2 for i in x], [r.generic_ms for r in hashed], width, label="generic")
+        plt.bar([i + width / 2 for i in x], [r.spec_ms for r in hashed], width, label="specialized")
         plt.xticks(x, labels, rotation=60, ha="right")
         plt.ylabel("ms")
-        plt.title("Hashed / SHA3 Transcript Median Runtime / bits=64")
+        plt.title("Hashed / SHA3 Transcript Runtime / bits=64")
+        plt.legend()
         plt.tight_layout()
         plt.savefig(path / "hashed_runtime_bits64.png", dpi=160)
         plt.close()

@@ -181,60 +181,6 @@ _EXPR_TO_ID = {
     "a*b*c": 3,
 }
 
-def sumcheck_expr(eval_tables, challenges, modulus: Optional[int] = None, expr: str = "a*b"):
-    """Fused native SumCheck for the benchmark expression family.
-
-    Supported:
-        a
-        a*b
-        a*b + c
-        a*b*c
-
-    For Torch CUDA inputs, this calls one native CUDA extension function.
-    """
-    p = int(FIELD_MODULUS if modulus is None else modulus)
-    if expr not in _EXPR_TO_ID:
-        raise ValueError(f"unsupported expr {expr!r}; expected one of {sorted(_EXPR_TO_ID)}")
-
-    if _is_torch_tensor(eval_tables):
-        import torch
-        if eval_tables.is_cuda:
-            native = _try_import_native() or _try_jit_native()
-            if native is not None and hasattr(native, "sumcheck_expr_cuda"):
-                tables = _torch_to_uint64_cuda(eval_tables, eval_tables.device)
-                rs = challenges if isinstance(challenges, torch.Tensor) else torch.as_tensor(challenges)
-                rs = _torch_to_uint64_cuda(rs, eval_tables.device)
-                return native.sumcheck_expr_cuda(tables, rs, int(p), int(_EXPR_TO_ID[expr]))
-
-    # CPU fallback for small tests.
-    tables_np = _to_numpy_for_reference(eval_tables)
-    challenges_np = _to_numpy_for_reference(challenges)
-    rows = tables_np.tolist()
-    rs = challenges_np.reshape(-1).tolist()
-
-    if expr == "a":
-        out = sumcheck_reference([rows[0]], rs, p)
-    elif expr == "a*b":
-        out = sumcheck_reference([rows[0], rows[1]], rs, p)
-    elif expr == "a*b*c":
-        out = sumcheck_reference([rows[0], rows[1], rows[2]], rs, p)
-    elif expr in ("a*b + c", "a*b+c"):
-        ab = sumcheck_reference([rows[0], rows[1]], rs, p)
-        c = sumcheck_reference([rows[2]], rs, p)
-        out = []
-        for ab_row, c_row in zip(ab, c):
-            c0, c1 = int(c_row[0]), int(c_row[1])
-            c2 = (2 * c1 - c0) % p
-            out.append([
-                (int(ab_row[0]) + c0) % p,
-                (int(ab_row[1]) + c1) % p,
-                (int(ab_row[2]) + c2) % p,
-            ])
-    else:
-        raise ValueError(expr)
-
-    return _wrap_like_input(out, eval_tables)
-
 def _expr_to_terms_uploaded_base(expr: str):
     expr = expr.replace(' ', '')
     if expr == 'a':

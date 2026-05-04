@@ -40,7 +40,7 @@ SCALING_POLYS = [
 
 PLOT_STANDARD_BITS = 64
 PLOT_STANDARD_NUM_VARS = 16
-PLOT_NUM_VARS_VALUES = [12, 16, 20]
+PLOT_NUM_VARS_VALUES = [4, 16, 20]
 PLOT_REPRESENTATIVE_POLYS = [
     "baseline_mul",
     "vanilla_gate",
@@ -795,11 +795,7 @@ def main() -> None:
 
     PLOT_STANDARD_BITS = int(args.plot_standard_bits)
     PLOT_STANDARD_NUM_VARS = int(args.plot_standard_num_vars)
-    PLOT_NUM_VARS_VALUES = [
-        int(x.strip())
-        for x in str(args.plot_num_vars_values).split(",")
-        if x.strip()
-    ]
+    PLOT_NUM_VARS_VALUES = [4, 16, 20]
     PLOT_REPRESENTATIVE_POLYS = [
         x.strip()
         for x in str(args.plot_polys).split(",")

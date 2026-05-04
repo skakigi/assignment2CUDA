@@ -136,46 +136,13 @@ struct DeviceBuffer {
 
 
 
-inline uint64_t make_barrett_mu_u32_host(uint32_t q) {
-    if (q <= 1U) {
-        return 0ULL;
-    }
-    return static_cast<uint64_t>((static_cast<unsigned __int128>(1) << 64) / q);
-}
 
-inline uint32_t add_mod_u32_host(uint32_t a, uint32_t b, uint32_t q) {
-    if (q <= 1U) {
-        return 0U;
-    }
-    uint64_t s = static_cast<uint64_t>(a) + static_cast<uint64_t>(b);
-    if (s >= static_cast<uint64_t>(q)) {
-        s -= static_cast<uint64_t>(q);
-    }
-    return static_cast<uint32_t>(s);
-}
 
 
 
 
 
 constexpr int kEvalTStride = 4;
-inline size_t eval_shared_bytes_for_variant(
-    SpecEvalStrategy variant,
-    int eval_threads,
-    int32_t n_terms,
-    int32_t total_term_vars) {
-    const size_t metadata_bytes = static_cast<size_t>(n_terms + 1 + total_term_vars) * sizeof(int32_t);
-    if (variant == SpecEvalStrategy::kBaselineShared ||
-        variant == SpecEvalStrategy::kMleTiledShared) {
-        return static_cast<size_t>(kEvalTStride) * static_cast<size_t>(eval_threads) * sizeof(uint32_t) +
-               metadata_bytes;
-    }
-    const size_t warp_count = static_cast<size_t>((eval_threads + 31) / 32);
-    if (variant == SpecEvalStrategy::kMleTiledWarp) {
-        return static_cast<size_t>(kEvalTStride) * warp_count * sizeof(uint32_t) + metadata_bytes;
-    }
-    return static_cast<size_t>(kEvalTStride) * warp_count * sizeof(uint64_t) + metadata_bytes;
-}
 
 
 
@@ -204,7 +171,6 @@ using u32 = uint32_t;
 using u64 = uint64_t;
 
 constexpr int THREADS = 128;
-constexpr int MAX_BLOCKS = 4096;
 constexpr u32 Q32_FAST = 4294967291u; // 2^32 - 5
 
 __device__ __forceinline__ u32 add_mod(u32 a, u32 b, u32 q) {

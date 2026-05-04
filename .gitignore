@@ -33,6 +33,7 @@ dist/
 notebooks/
 
 # Benchmark output artifacts
+reports/
 reports/raw/
 reports/plots/
 reports/*.csv

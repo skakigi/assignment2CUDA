@@ -407,7 +407,7 @@ Run:
 python scripts/build_extension.py
 pytest -q tests/test_correctness.py tests/test_cuda_full_mont_correctness.py
 
-
+```
 ## Limitations
 
 This project is a SumCheck kernel implementation and benchmark framework.

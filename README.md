@@ -395,6 +395,19 @@ Common polynomial structures can be handled with specialized code paths instead 
 
 ---
 
+## Correctness testing
+
+The CUDA SumCheck implementation has two correctness layers.
+
+### 1. Pytest CPU-reference checks
+
+Run:
+
+```bash
+python scripts/build_extension.py
+pytest -q tests/test_correctness.py tests/test_cuda_full_mont_correctness.py
+
+
 ## Limitations
 
 This project is a SumCheck kernel implementation and benchmark framework.

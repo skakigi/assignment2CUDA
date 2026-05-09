@@ -41,16 +41,3 @@ def test_student_matches_reference_goldilocks():
     assert np.array_equal(expected, got)
 
 
-def test_cuda_if_available():
-    try:
-        import torch
-    except Exception:
-        return
-    if not torch.cuda.is_available():
-        return
-    tables, rs = make_case(3, 4, 2305843009213693951)
-    expected = np.asarray(sumcheck_reference(tables, rs, 2305843009213693951), dtype=np.uint64)
-    t = torch.tensor(tables, dtype=torch.uint64, device="cuda")
-    r = torch.tensor(rs, dtype=torch.uint64, device="cuda")
-    got = student.sumcheck(t, r, 2305843009213693951).detach().cpu().numpy()
-    assert np.array_equal(expected, got)

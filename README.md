@@ -408,6 +408,23 @@ python scripts/build_extension.py
 pytest -q tests/test_correctness.py tests/test_cuda_full_mont_correctness.py
 
 ```
+
+```text
+This pytest checks:
+baseline_linear
+baseline_mul
+baseline_mul_add
+baseline_cubic_product
+advanced_abc_plus_de
+vanilla_gate
+vanilla_zero
+vanilla_perm
+opencheck_6
+degree_sweep_deg7
+
+against a cpu implementation
+```
+
 ## Limitations
 
 This project is a SumCheck kernel implementation and benchmark framework.
